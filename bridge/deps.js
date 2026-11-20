@@ -21,8 +21,12 @@ function ensurePlaywright(log = () => {}) {
   fs.mkdirSync(cfg.HOME, { recursive: true });
   const pkg = path.join(cfg.HOME, 'package.json');
   if (!fs.existsSync(pkg)) fs.writeFileSync(pkg, JSON.stringify({ name: 'neon-bridge-home', private: true }, null, 1));
-  const r = spawnSync('npm', ['install', `playwright-core@${cfg.PLAYWRIGHT_VERSION}`, '--no-audit', '--no-fund', '--prefix', cfg.HOME], {
-    stdio: ['ignore', 'ignore', 'inherit'], shell: process.platform === 'win32',
+  // On Windows npm is npm.cmd, so it has to run through the shell, and the shell gets the args joined
+  // with plain spaces. Quote them, or a home path with a space (C:\Users\First Last) splits in two.
+  const win = process.platform === 'win32';
+  const args = ['install', `playwright-core@${cfg.PLAYWRIGHT_VERSION}`, '--no-audit', '--no-fund', '--prefix', cfg.HOME];
+  const r = spawnSync('npm', win ? args.map(a => `"${a}"`) : args, {
+    stdio: ['ignore', 'ignore', 'inherit'], shell: win,
     env: { ...process.env, PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1' },
   });
   if (r.status !== 0 || !resolvePlaywright()) throw new Error('Could not install playwright-core (is npm on PATH?)');
