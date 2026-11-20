@@ -1,0 +1,12 @@
+{
+  "name": "neon-bridge",
+  "description": "Gemini 4 Neon as a second assistant inside Claude Code (unofficial).",
+  "owner": { "name": "Ousen69" },
+  "plugins": [
+    {
+      "name": "neon-bridge",
+      "source": "./",
+      "description": "Use Gemini 4 Neon from Claude Code via your own Gemini subscription."
+    }
+  ]
+}

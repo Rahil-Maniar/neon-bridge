@@ -1,0 +1,14 @@
+# Never commit: browser profile = your Google session cookies
+profile/
+.neon-bridge/
+
+# Local state and logs (contain chat URLs / activity)
+sessions.json
+daemon.log
+*.log
+tmp/
+config.json
+
+node_modules/
+.DS_Store
+Thumbs.db
