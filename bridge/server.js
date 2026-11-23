@@ -172,7 +172,7 @@ async function getSession(name, temp) {
   return { s, warnings };
 }
 
-async function ask({ session, prompt, attach = [], temp = true, model = cfg.DEFAULT_MODEL, timeoutSec = 600 }) {
+async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEFAULT_MODEL, timeoutSec = 600 }) {
   const t0 = Date.now();
   const name = session || ('_once_' + t0 + Math.random().toString(36).slice(2, 6));
   const { s, warnings } = await getSession(name, temp);

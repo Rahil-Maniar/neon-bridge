@@ -13,7 +13,8 @@
 //                          and saved to a file (the model gets two tries to fix one that doesn't apply)
 //     --patch-out PATH     where to save the patch (implies --patch; default: the bridge tmp folder)
 //     --model NAME         Gemini mode to use (default: Neon, or NEON_MODEL / config.json "model")
-//     --save               keep the chat in Gemini history (default: temporary chat)
+//     --temp               use a temporary chat, kept out of Gemini history (default: saved chat;
+//                          note: Neon may not reply in temporary chats)
 //     --max-rounds N       agent-mode tool rounds (default 12)
 //     --file PATH          read the prompt from a file
 //     --timeout SEC        per-turn timeout (default 600)
@@ -111,7 +112,8 @@ function parseArgs(argv) {
     else if (a === '-a' || a === '--attach') o.attach.push(path.resolve(argv[++i]));
     else if (a === '--agent') o.agent = path.resolve(argv[++i]);
     else if (a === '--model') o.model = argv[++i];
-    else if (a === '--save') o.save = true;
+    else if (a === '--temp') o.temp = true;
+    else if (a === '--save') o.temp = false; // the default; kept for older scripts
     else if (a === '--max-rounds') o.maxRounds = +argv[++i];
     else if (a === '--allow-run') (o.allowRun = o.allowRun || []).push(argv[++i]);
     else if (a === '--run-timeout') o.runTimeout = +argv[++i];
@@ -145,7 +147,7 @@ async function ask(o) {
   }
 
   const session = o.session || (o.agent ? `_agent_${Date.now()}` : undefined);
-  const base = { session, temp: !o.save, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL };
+  const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL };
   const send = (msg, label) => msg.length > 20000
     ? call('POST', '/ask', { ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
     : call('POST', '/ask', { ...base, prompt: msg });

@@ -28,7 +28,7 @@ Claude Code ──skill──▶ neon.js (CLI) ──HTTP, localhost only──�
 | **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …) in that folder. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
 | **Run checks** | `--allow-run "npm test"`: Neon may also run that command (plus extra args) to check its ideas. Off by default; only the prefixes you allow |
 | **Patches** | `--patch`: Neon proposes changes as a unified diff. It is checked with `git apply --check`, saved to a file, never applied, and sent back to Neon if it doesn't apply |
-| **Clean history** | Chats are temporary by default. Use `--save` to keep one |
+| **History** | Chats are saved to your Gemini history. Use `--temp` for a temporary chat (Neon may not reply in temporary chats) |
 | **Other models** | `--model Hydrogen` (or `Carbon` if your plan includes it) |
 | **Parallel** | Separate sessions can run at the same time |
 

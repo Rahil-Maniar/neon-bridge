@@ -25,7 +25,7 @@ node "${CLAUDE_PLUGIN_ROOT}/bridge/neon.js" ask --file prompt.md                
 node "${CLAUDE_PLUGIN_ROOT}/bridge/neon.js" sessions | end NAME | status | stop | doctor
 ```
 Options:
-- `--save` keeps the chat in the user's Gemini history (the default is a temporary chat)
+- `--temp` uses a temporary chat kept out of the user's Gemini history (the default is a saved chat). Neon may hang in temporary chats, so avoid it with Neon unless the user asks
 - `--model NAME` picks another Gemini mode, e.g. `Hydrogen`, or `Carbon` on plans that include it
 - `--timeout SEC`, default 600
 - `--max-rounds N`, agent mode, default 12
