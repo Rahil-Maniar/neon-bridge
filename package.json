@@ -1,6 +1,6 @@
 {
   "name": "neon-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Use Gemini 4 Neon from Claude Code (or any terminal) via your own Gemini subscription. Unofficial.",
   "private": true,
   "license": "MIT",

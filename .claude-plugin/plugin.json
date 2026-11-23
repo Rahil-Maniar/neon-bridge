@@ -1,6 +1,6 @@
 {
   "name": "neon-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Use Gemini 4 Neon (or other Gemini web modes) from Claude Code via your own Gemini subscription: second opinions, multi-turn chats, attachments, and a read-only agent mode. Unofficial.",
   "author": { "name": "Ousen69" },
   "homepage": "https://github.com/Rahil-Maniar/neon-bridge",
