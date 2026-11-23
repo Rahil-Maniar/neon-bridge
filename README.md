@@ -25,7 +25,9 @@ Claude Code ──skill──▶ neon.js (CLI) ──HTTP, localhost only──�
 | **One-shot questions** | `neon.js ask "..."` |
 | **Multi-turn sessions** | `-s NAME` continues the same conversation, so Claude can push back and follow up |
 | **Attachments** | `-a file` uploads code, PDFs, images and so on. Prompts over 20k characters are sent as a file automatically |
-| **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` files in that folder, read-only. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
+| **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …) in that folder. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
+| **Run checks** | `--allow-run "npm test"`: Neon may also run that command (plus extra args) to check its ideas. Off by default; only the prefixes you allow |
+| **Patches** | `--patch`: Neon proposes changes as a unified diff. It is checked with `git apply --check`, saved to a file, never applied, and sent back to Neon if it doesn't apply |
 | **Clean history** | Chats are temporary by default. Use `--save` to keep one |
 | **Other models** | `--model Hydrogen` (or `Carbon` if your plan includes it) |
 | **Parallel** | Separate sessions can run at the same time |
@@ -75,6 +77,7 @@ node bridge/neon.js ask "Explain the tradeoffs of optimistic vs pessimistic lock
 node bridge/neon.js ask -s design "Here's my plan: ..."  &&  node bridge/neon.js ask -s design "What would you cut?"
 node bridge/neon.js ask -a report.pdf "Summarize the risks in this report"
 node bridge/neon.js ask --agent ./my-repo "Find the most likely cause of the race condition in the job queue"
+node bridge/neon.js ask --agent ./my-repo --allow-run "npm test" --patch "Fix the failing date parser test"
 node bridge/neon.js doctor | sessions | end NAME | status | stop [--force]
 ```
 Exit codes: `0` ok, `2` not set up or signed out, `3` model not available, `4` timed out or partial answer, `1` other.
@@ -96,7 +99,8 @@ Environment variables, or `config.json` in the bridge home:
 - **Your Google session lives in `~/.neon-bridge/profile`.** Treat that folder like a password: never share or commit it. `.gitignore` excludes it if it ends up inside the repo.
 - Everything you send goes to Google under your account, **even temporary chats**. By default the skill tells Claude never to send login secrets, and to ask before sending sensitive third-party material. If you're comfortable sharing more, say so in your `CLAUDE.md`, for example: *"Sharing project material with Neon is pre-approved."*
 - The daemon and the browser's debugging port listen on **127.0.0.1 only**. Note that any program running as you on the same machine could still talk to them.
-- Agent mode is read-only and confined to the folder you pass it.
+- Agent mode is read-only and confined to the folder you pass it, unless you add `--allow-run`. Allowed commands run in that folder with your permissions, and running a project's tests executes its code, so allow only specific commands (`npm test`, not `npm`) on projects you trust. Patches are only ever checked, never applied.
+- Tests for the agent tools: `npm test` (no browser or Google account needed).
 
 ## Troubleshooting
 
