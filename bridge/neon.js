@@ -6,6 +6,11 @@
 //   node neon.js ask [options] [prompt]        prompt from argument, --file, or stdin
 //     -s, --session NAME   multi-turn: the same NAME continues the conversation
 //     -a, --attach PATH    attach a file (repeatable): code, pdf, images, ...
+//     --with-chat          share the current Claude Code conversation (what was said, not tool output;
+//                          secrets redacted; newest turns kept) as an attached file
+//     --chat-file PATH     share this transcript (.jsonl) instead of the current session's (implies --with-chat)
+//     --chat-max CHARS     size limit for the shared conversation (default 80000)
+//     --chat-preview       print what --with-chat would share, and send nothing
 //     --agent ROOT         agent mode: the model can LIST/READ/GREP/FIND/DEFS/GIT under ROOT (read-only)
 //     --allow-run CMD      agent mode: also let it RUN this command prefix in ROOT (repeatable), e.g. "npm test"
 //     --run-timeout SEC    per-command limit for RUN (default 300)
@@ -28,6 +33,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const cfg = require('./config');
 const { ensurePlaywright, resolvePlaywright } = require('./deps');
+const chat = require('./chat');
 const agent = require('./agent');
 
 const err = (...m) => process.stderr.write('[neon] ' + m.join(' ') + '\n');
@@ -112,6 +118,10 @@ function parseArgs(argv) {
     else if (a === '-a' || a === '--attach') o.attach.push(path.resolve(argv[++i]));
     else if (a === '--agent') o.agent = path.resolve(argv[++i]);
     else if (a === '--model') o.model = argv[++i];
+    else if (a === '--with-chat') o.withChat = true;
+    else if (a === '--chat-file') { o.withChat = true; o.chatFile = path.resolve(argv[++i]); }
+    else if (a === '--chat-max') o.chatMax = +argv[++i];
+    else if (a === '--chat-preview') { o.withChat = true; o.chatPreview = true; }
     else if (a === '--temp') o.temp = true;
     else if (a === '--save') o.temp = false; // the default; kept for older scripts
     else if (a === '--max-rounds') o.maxRounds = +argv[++i];
@@ -137,9 +147,20 @@ async function ask(o) {
   if ((o.allowRun || o.patch) && !o.agent) { err('--allow-run and --patch need --agent ROOT'); return 1; }
   if (o.agent && !fs.existsSync(o.agent)) { err('agent folder not found: ' + o.agent); return 1; }
   const tools = { allowRun: o.allowRun, runTimeoutSec: o.runTimeout, patch: o.patch };
+  let brief = null;
+  if (o.withChat) {
+    brief = chat.buildBrief(chat.findTranscript(o.chatFile), { maxChars: o.chatMax || 80000 });
+    err(`conversation: ${brief.turns} turns, ${brief.chars} chars` + (brief.omittedTurns ? `, ${brief.omittedTurns} older turns left out` : '') + `, ${brief.redactions} secret(s) redacted`);
+    if (o.chatPreview) { process.stdout.write(brief.text + '\n'); return 0; }
+  }
   await ensureDaemon();
 
   const attach = [...o.attach];
+  if (brief) { // a fixed file name so the model can refer to it
+    const dir = path.join(cfg.TMP, `chat-${Date.now()}`); fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, 'conversation.md'); fs.writeFileSync(f, brief.text); attach.push(f);
+    prompt = chat.chatPreamble + prompt;
+  }
   const asFile = (text, label) => { const f = path.join(cfg.TMP, `${label}-${Date.now()}.md`); fs.writeFileSync(f, text); return f; };
   if (prompt.length > 20000) { // long prompts go up as an attached file
     const f = asFile(prompt, 'context'); attach.push(f);
