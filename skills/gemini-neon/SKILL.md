@@ -25,10 +25,13 @@ node "${CLAUDE_PLUGIN_ROOT}/bridge/neon.js" ask --file prompt.md                
 node "${CLAUDE_PLUGIN_ROOT}/bridge/neon.js" sessions | end NAME | status | stop | doctor
 ```
 Options:
-- `--save` keeps the chat in the user's Gemini history (the default is a temporary chat)
+- `--temp` uses a temporary chat kept out of the user's Gemini history (the default is a saved chat). Neon may hang in temporary chats, so avoid it with Neon unless the user asks
 - `--model NAME` picks another Gemini mode, e.g. `Hydrogen`, or `Carbon` on plans that include it
 - `--timeout SEC`, default 600
 - `--max-rounds N`, agent mode, default 12
+- `--allow-run "CMD"` (agent mode, repeatable) lets Neon run that command prefix in ROOT
+- `--run-timeout SEC`, per RUN command, default 300
+- `--patch` / `--patch-out PATH` (agent mode) asks for changes as a checked unified diff
 - `--json`
 
 Output and behavior:
@@ -39,7 +42,18 @@ Output and behavior:
 - Different sessions can run in parallel. A single session handles one request at a time.
 
 ## Agent mode
-`--agent ROOT` gives the model read-only tools inside ROOT: `LIST`, `READ` (with line ranges), `GREP` (regex) and `FIND`. It decides what to read, the bridge runs it and sends back the results, and this loops until it gives a final answer. Paths outside ROOT are refused, as are secret-like files (`.env`, keys, credentials, `.ssh`, `.git` internals). Dependency and build folders are skipped. Use it for independent code reviews, bug hunts or architecture questions. Neon can't edit files or run commands; you make any changes.
+`--agent ROOT` gives the model read-only tools inside ROOT: `LIST`, `READ` (with line ranges), `GREP` (regex, optional `context=N`), `FIND`, `DEFS` (where a function/class/variable is defined) and `GIT` (read-only: diff, log, show, blame, status, ls-files, grep, shortlog, rev-parse, branch/tag listing). It decides what to read, the bridge runs it and sends back the results, and this loops until it gives a final answer. Paths outside ROOT are refused, as are secret-like files (`.env`, keys, credentials, `.ssh`, `.git` internals), including their sections in git diffs. Dependency and build folders are skipped. Use it for independent code reviews, bug hunts or architecture questions.
+
+**Running commands (`--allow-run`).** Off by default. Each `--allow-run "npm test"` lets Neon `RUN` that command, optionally with extra arguments (e.g. `npm test -- -t parser`), in ROOT. It gets the exit code and output, so it can check its theory instead of guessing. Commands run with `CI=1`, no stdin, a timeout, and are killed with their whole process tree on timeout. On Windows, arguments containing `& | < > ^ %` or quotes are refused.
+- Allow only specific, non-destructive commands you would run yourself: tests, type checks, linters, builds (`npm test`, `npx tsc --noEmit`, `pytest`, `cargo check`). Never broad prefixes like `npm`, `node`, `python`, `bash` or `git`, and nothing that deploys, publishes, installs, deletes or touches the network.
+- Running the repo's tests executes its code. Only allow it for the user's own project, and ask first if the user hasn't asked for Neon to run things.
+
+**Patches (`--patch`).** Neon puts its proposed changes in a `neon-patch` unified diff. The bridge checks it with `git apply --check` (never applies it), saves it to a file, and prints the path and the exact apply command on stderr. If it doesn't apply, Neon is shown the error and gets two tries to fix it. With `--json` the result has `patch: {file, applies, strip, error}`. Review the patch like any other suggestion before you apply it; you remain the one who changes files.
+
+Example of a full investigation:
+```
+node "${CLAUDE_PLUGIN_ROOT}/bridge/neon.js" ask --agent . --allow-run "npm test" --patch "The parser test fails on empty input. Find the cause, confirm it by running the test, and propose a fix."
+```
 
 ## How to think about Neon
 Treat Neon as a peer with a different perspective, not a lesser tool. Engage with its reasoning, credit its good ideas, and be open to being the one who's wrong. When you disagree, say why on the merits.

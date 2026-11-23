@@ -7,7 +7,8 @@
   "bin": { "neon-bridge": "bridge/neon.js" },
   "scripts": {
     "setup": "node bridge/neon.js setup",
-    "doctor": "node bridge/neon.js doctor"
+    "doctor": "node bridge/neon.js doctor",
+    "test": "node --test test/agent.test.js"
   },
   "engines": { "node": ">=18" },
   "dependencies": {

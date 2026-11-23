@@ -6,9 +6,15 @@
 //   node neon.js ask [options] [prompt]        prompt from argument, --file, or stdin
 //     -s, --session NAME   multi-turn: the same NAME continues the conversation
 //     -a, --attach PATH    attach a file (repeatable): code, pdf, images, ...
-//     --agent ROOT         agent mode: the model can LIST/READ/GREP/FIND files under ROOT (read-only)
+//     --agent ROOT         agent mode: the model can LIST/READ/GREP/FIND/DEFS/GIT under ROOT (read-only)
+//     --allow-run CMD      agent mode: also let it RUN this command prefix in ROOT (repeatable), e.g. "npm test"
+//     --run-timeout SEC    per-command limit for RUN (default 300)
+//     --patch              agent mode: ask for changes as a unified diff; it is checked, never applied,
+//                          and saved to a file (the model gets two tries to fix one that doesn't apply)
+//     --patch-out PATH     where to save the patch (implies --patch; default: the bridge tmp folder)
 //     --model NAME         Gemini mode to use (default: Neon, or NEON_MODEL / config.json "model")
-//     --save               keep the chat in Gemini history (default: temporary chat)
+//     --temp               use a temporary chat, kept out of Gemini history (default: saved chat;
+//                          note: Neon may not reply in temporary chats)
 //     --max-rounds N       agent-mode tool rounds (default 12)
 //     --file PATH          read the prompt from a file
 //     --timeout SEC        per-turn timeout (default 600)
@@ -22,6 +28,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const cfg = require('./config');
 const { ensurePlaywright, resolvePlaywright } = require('./deps');
+const agent = require('./agent');
 
 const err = (...m) => process.stderr.write('[neon] ' + m.join(' ') + '\n');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -57,100 +64,6 @@ async function forceCloseBrowser() {
   const pw = resolvePlaywright(); if (!pw) return false;
   try { const b = await pw.chromium.connectOverCDP(`http://127.0.0.1:${cfg.CDP_PORT}`); const s = await b.newBrowserCDPSession(); await s.send('Browser.close').catch(() => {}); return true; }
   catch { return false; }
-}
-
-// ---------- agent tools (read-only, confined to ROOT) ----------
-const DENY = [/(^|[\\/])\.env(\..*)?$/i, /\.(pem|key|p12|pfx|keystore|jks|kdbx)$/i, /(^|[\\/])id_(rsa|ed25519|ecdsa|dsa)/i,
-  /credentials?(\.json)?$/i, /(^|[\\/])secrets?(\.|[\\/]|$)/i, /(^|[\\/])\.git[\\/]/i, /(^|[\\/])\.(npmrc|netrc|pypirc)$/i,
-  /(^|[\\/])\.(ssh|aws|gnupg|docker|kube)[\\/]/i];
-const SKIP_DIRS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist', 'build', '.next', '.cache', 'target', 'bin', 'obj', '.neon-bridge']);
-const MAX_OUT = 60000;
-
-function resolveIn(root, p) {
-  const full = path.resolve(root, p || '.');
-  const rel = path.relative(root, full);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('outside the allowed folder');
-  if (DENY.some(r => r.test(full))) throw new Error('denied (sensitive file)');
-  return full;
-}
-let walked = 0;
-function* walk(dir, depth = 0, maxDepth = 12) {
-  if (depth === 0) walked = 0;
-  if (++walked > 20000) return;
-  let ents = []; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const e of ents) {
-    const f = path.join(dir, e.name);
-    if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name) && depth < maxDepth) { yield { f, dir: true, depth }; yield* walk(f, depth + 1, maxDepth); } }
-    else yield { f, dir: false, depth };
-  }
-}
-const isText = f => { try { return !fs.readFileSync(f).subarray(0, 4096).includes(0); } catch { return false; } };
-
-function runTool(root, line) {
-  const m = line.trim().match(/^(READ|LIST|GREP|FIND)\s*(.*)$/i);
-  if (!m) return `ERROR: unknown command "${line.trim()}"`;
-  const cmd = m[1].toUpperCase(), arg = m[2].trim();
-  try {
-    if (cmd === 'READ') {
-      const mm = arg.match(/^(.+?)(?:\s+(\d+)\s*[-:]\s*(\d+))?$/);
-      const rel = mm[1].replace(/^["']|["']$/g, ''), f = resolveIn(root, rel);
-      if (!isText(f)) return 'ERROR: binary or unreadable file';
-      const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/);
-      const a = mm[2] ? Math.max(1, +mm[2]) : 1, b = mm[3] ? Math.min(lines.length, +mm[3]) : Math.min(lines.length, a + 799);
-      let out = lines.slice(a - 1, b).map((l, i) => `${a + i}\t${l}`).join('\n');
-      if (b < lines.length) out += `\n... (${lines.length} lines total; READ ${rel} ${b + 1}-${Math.min(lines.length, b + 800)} for more)`;
-      return out;
-    }
-    if (cmd === 'LIST') {
-      const mm = arg.match(/^(.*?)(?:\s+depth=(\d+))?$/);
-      const d = resolveIn(root, mm[1] || '.'), maxD = mm[2] ? +mm[2] : 2, out = [];
-      for (const e of walk(d, 0, maxD - 1)) { out.push('  '.repeat(e.depth) + path.basename(e.f) + (e.dir ? '/' : '')); if (out.length >= 400) { out.push('... (truncated)'); break; } }
-      return out.join('\n') || '(empty)';
-    }
-    if (cmd === 'GREP') {
-      const mm = arg.match(/^\/(.+)\/([a-z]*)\s*(.*)$/) || arg.match(/^(\S+)()\s*(.*)$/);
-      const re = new RegExp(mm[1], (mm[2] || '').replace(/[^imsu]/g, '')), d = resolveIn(root, mm[3] || '.'), out = [];
-      for (const e of walk(d)) {
-        if (e.dir || DENY.some(r => r.test(e.f))) continue;
-        try { if (fs.statSync(e.f).size > 2e6 || !isText(e.f)) continue; } catch { continue; }
-        fs.readFileSync(e.f, 'utf8').split(/\r?\n/).forEach((l, i) => { if (out.length < 150 && re.test(l)) out.push(`${path.relative(root, e.f)}:${i + 1}: ${l.slice(0, 240)}`); });
-        if (out.length >= 150) { out.push('... (truncated at 150 matches)'); break; }
-      }
-      return out.join('\n') || '(no matches)';
-    }
-    if (cmd === 'FIND') {
-      const needle = arg.toLowerCase().replace(/\*/g, ''), out = [];
-      for (const e of walk(root)) { if (path.basename(e.f).toLowerCase().includes(needle)) out.push(path.relative(root, e.f) + (e.dir ? '/' : '')); if (out.length >= 200) break; }
-      return out.join('\n') || '(nothing found)';
-    }
-  } catch (e) { return 'ERROR: ' + e.message; }
-}
-
-const agentPreamble = root => `You are working as a careful engineering assistant with READ-ONLY access to a folder on my computer (the "workspace", root = ${root}). You cannot see it unless you ask.
-
-To use a tool, reply with ONLY a fenced block like this and nothing else, then stop and wait:
-\`\`\`neon-tools
-LIST . depth=2
-READ src/app.py
-READ src/app.py 200-400
-GREP /def handle_\\w+/ src
-FIND config
-\`\`\`
-Commands (paths relative to the root; one per line; up to 8 per block):
-- LIST <dir> [depth=N]  : directory tree (default depth 2)
-- READ <file> [a-b]     : file with line numbers (800 lines per call)
-- GREP /regex/[i] [dir] : search file contents
-- FIND <name-part>      : find files/folders by name
-I will reply with the results. Use as many rounds as you need, but batch commands. Do not guess file contents—read them.
-When you have enough information, give your FINAL answer as normal markdown with NO neon-tools block. Cite files as path:line where relevant.
-
-TASK:
-`;
-
-function extractTools(answer) {
-  // The web UI may relabel the fence (e.g. "code snippet"), so accept any info string whose body is only tool lines.
-  const m = answer.match(/```neon-tools\s*\n([\s\S]*?)```/i) || answer.match(/```[^\n]*\n((?:[ \t]*(?:READ|LIST|GREP|FIND)\b[^\n]*\n?)+)```/i);
-  return m ? m[1].split('\n').map(l => l.trim()).filter(Boolean).slice(0, 8) : null;
 }
 
 // ---------- commands ----------
@@ -199,8 +112,13 @@ function parseArgs(argv) {
     else if (a === '-a' || a === '--attach') o.attach.push(path.resolve(argv[++i]));
     else if (a === '--agent') o.agent = path.resolve(argv[++i]);
     else if (a === '--model') o.model = argv[++i];
-    else if (a === '--save') o.save = true;
+    else if (a === '--temp') o.temp = true;
+    else if (a === '--save') o.temp = false; // the default; kept for older scripts
     else if (a === '--max-rounds') o.maxRounds = +argv[++i];
+    else if (a === '--allow-run') (o.allowRun = o.allowRun || []).push(argv[++i]);
+    else if (a === '--run-timeout') o.runTimeout = +argv[++i];
+    else if (a === '--patch') o.patch = true;
+    else if (a === '--patch-out') { o.patch = true; o.patchOut = path.resolve(argv[++i]); }
     else if (a === '--file') o.file = argv[++i];
     else if (a === '--timeout') o.timeout = +argv[++i];
     else if (a === '--json') o.json = true;
@@ -216,6 +134,9 @@ async function ask(o) {
   let prompt = (o.file ? fs.readFileSync(o.file, 'utf8') : (o.rest.length ? o.rest.join(' ') : await readStdin())).trim();
   if (!prompt) { err('empty prompt'); return 1; }
   for (const f of o.attach) if (!fs.existsSync(f)) { err('attachment not found: ' + f); return 1; }
+  if ((o.allowRun || o.patch) && !o.agent) { err('--allow-run and --patch need --agent ROOT'); return 1; }
+  if (o.agent && !fs.existsSync(o.agent)) { err('agent folder not found: ' + o.agent); return 1; }
+  const tools = { allowRun: o.allowRun, runTimeoutSec: o.runTimeout, patch: o.patch };
   await ensureDaemon();
 
   const attach = [...o.attach];
@@ -226,27 +147,52 @@ async function ask(o) {
   }
 
   const session = o.session || (o.agent ? `_agent_${Date.now()}` : undefined);
-  const base = { session, temp: !o.save, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL };
-  let r = await call('POST', '/ask', { ...base, prompt: o.agent ? agentPreamble(o.agent) + prompt : prompt, attach });
+  const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL };
+  const send = (msg, label) => msg.length > 20000
+    ? call('POST', '/ask', { ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
+    : call('POST', '/ask', { ...base, prompt: msg });
+  let r = await call('POST', '/ask', { ...base, prompt: o.agent ? agent.agentPreamble(o.agent, tools) + prompt : prompt, attach });
   const rounds = o.maxRounds || 12;
-  for (let i = 0; o.agent && r.ok && i < rounds; i++) {
-    const tools = extractTools(r.answer);
-    if (!tools) break;
-    err(`round ${i + 1}: ` + tools.join(' ; '));
-    let results = tools.map(t => `### ${t}\n\`\`\`\n${runTool(o.agent, t)}\n\`\`\``).join('\n\n');
-    if (results.length > MAX_OUT) results = results.slice(0, MAX_OUT) + '\n... (results truncated; request smaller ranges)';
-    const msg = 'Tool results:\n\n' + results + (i === rounds - 1 ? '\n\nThis was the last tool round. Give your FINAL answer now.' : '');
-    r = msg.length > 20000
-      ? await call('POST', '/ask', { ...base, prompt: `Tool results for round ${i + 1} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
-      : await call('POST', '/ask', { ...base, prompt: msg });
+  let round = 0, fixes = 0, explanation = null, patch = null;
+  while (o.agent && r.ok) {
+    const cmds = agent.extractTools(r.answer);
+    if (cmds) {
+      if (round >= rounds) break;
+      round++;
+      err(`round ${round}: ` + cmds.join(' ; '));
+      const parts = [];
+      for (const t of cmds) parts.push(`### ${t}\n\`\`\`\n${await agent.runTool(o.agent, t, tools)}\n\`\`\``); // one at a time
+      let results = parts.join('\n\n');
+      if (results.length > agent.MAX_OUT) results = results.slice(0, agent.MAX_OUT) + '\n... (results truncated; request smaller ranges)';
+      const last = round === rounds ? '\n\nThis was the last tool round. Give your FINAL answer now.' : '';
+      r = await send('Tool results:\n\n' + results + last, `tool results for round ${round}`);
+      continue;
+    }
+    // Final answer. With --patch, check any proposed diff and give the model two chances to fix it.
+    if (!o.patch) break;
+    const text = agent.extractPatch(r.answer);
+    if (!text) break;
+    const file = o.patchOut || path.join(cfg.TMP, `patch-${Date.now()}.diff`);
+    const chk = agent.checkPatch(o.agent, text, file);
+    patch = { file, applies: chk.ok, strip: chk.strip, error: chk.error || null };
+    if (chk.ok !== false || fixes >= 2) break;
+    fixes++;
+    if (explanation === null) explanation = r.answer;
+    err(`patch does not apply (${chk.error.split('\n')[0]}); asking for a fix (${fixes}/2)`);
+    r = await send(`Your patch does not apply to the current files:\n\n\`\`\`\n${chk.error}\n\`\`\`\n\nRe-read the affected lines if needed (neon-tools still work), then reply with the complete corrected patch in ONE neon-patch block.`, 'patch check results');
   }
   if (o.agent && !o.session) await call('POST', '/end', { session }).catch(() => {});
+  if (explanation !== null && r.ok) r.answer = explanation + '\n\n---\n**Corrected patch** (the patch above did not apply; this one replaces it):\n\n' + r.answer;
+  if (patch) r.patch = patch;
 
   if (o.json) console.log(JSON.stringify(r, null, 1));
   else if (!r.ok) err(`${r.code}: ${r.error}`);
   else {
     for (const w of r.warnings || []) err('warning: ' + w);
     err(`model: Gemini ${r.model} | ${Math.round(r.ms / 1000)}s` + (o.session ? ` | session: ${o.session}` : ''));
+    if (patch) err(patch.applies
+      ? `patch: ${patch.file} (applies cleanly; to apply: git apply --recount --ignore-whitespace -p${patch.strip} "${patch.file}")`
+      : `patch: ${patch.file} (${patch.applies === null ? 'not checked' : 'does NOT apply'}: ${patch.error.split('\n')[0]})`);
     process.stdout.write(r.answer + '\n');
   }
   if (!r.ok) return EXIT[r.code] || 1;
@@ -271,7 +217,7 @@ async function main() {
     case 'sessions': await ensureDaemon(); console.log(JSON.stringify(await call('GET', '/sessions'), null, 1)); return 0;
     case 'end': await ensureDaemon(); await call('POST', '/end', { session: o.rest[0] }); err('ended', o.rest[0]); return 0;
     default:
-      console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 20).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
+      { const lines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/).slice(1); console.log(lines.slice(0, lines.findIndex(l => !l.startsWith('//'))).map(l => l.replace(/^\/\/ ?/, '')).join('\n')); }
       return cmd ? 1 : 0;
   }
 }
