@@ -17,6 +17,8 @@
 //     --patch              agent mode: ask for changes as a unified diff; it is checked, never applied,
 //                          and saved to a file (the model gets two tries to fix one that doesn't apply)
 //     --patch-out PATH     where to save the patch (implies --patch; default: the bridge tmp folder)
+//     --out DIR            where to save images/videos Gemini generates (default: a new folder in the
+//                          bridge tmp folder); their paths are listed after the answer
 //     --model NAME         Gemini mode to use (default: Neon, or NEON_MODEL / config.json "model")
 //     --temp               use a temporary chat, kept out of Gemini history (default: saved chat;
 //                          note: Neon may not reply in temporary chats)
@@ -129,6 +131,7 @@ function parseArgs(argv) {
     else if (a === '--run-timeout') o.runTimeout = +argv[++i];
     else if (a === '--patch') o.patch = true;
     else if (a === '--patch-out') { o.patch = true; o.patchOut = path.resolve(argv[++i]); }
+    else if (a === '--out') o.out = path.resolve(argv[++i]);
     else if (a === '--file') o.file = argv[++i];
     else if (a === '--timeout') o.timeout = +argv[++i];
     else if (a === '--json') o.json = true;
@@ -168,7 +171,7 @@ async function ask(o) {
   }
 
   const session = o.session || (o.agent ? `_agent_${Date.now()}` : undefined);
-  const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL };
+  const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL, mediaDir: o.out };
   const send = (msg, label) => msg.length > 20000
     ? call('POST', '/ask', { ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
     : call('POST', '/ask', { ...base, prompt: msg });
@@ -214,7 +217,10 @@ async function ask(o) {
     if (patch) err(patch.applies
       ? `patch: ${patch.file} (applies cleanly; to apply: git apply --recount --ignore-whitespace -p${patch.strip} "${patch.file}")`
       : `patch: ${patch.file} (${patch.applies === null ? 'not checked' : 'does NOT apply'}: ${patch.error.split('\n')[0]})`);
-    process.stdout.write(r.answer + '\n');
+    const media = r.media || [];
+    for (const m of media) err(`${m.type}: ${m.file} (${Math.round(m.bytes / 1024)} KB)`);
+    const list = media.length ? '\n\n**Generated files:**\n' + media.map(m => `- ${m.type}: ${m.file}`).join('\n') : '';
+    process.stdout.write((r.answer || '').trim() + list + '\n');
   }
   if (!r.ok) return EXIT[r.code] || 1;
   return r.partial ? 4 : 0;

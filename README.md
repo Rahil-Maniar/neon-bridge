@@ -24,7 +24,8 @@ Claude Code ──skill──▶ neon.js (CLI) ──HTTP, localhost only──�
 |---|---|
 | **One-shot questions** | `neon.js ask "..."` |
 | **Multi-turn sessions** | `-s NAME` continues the same conversation, so Claude can push back and follow up |
-| **Attachments** | `-a file` uploads code, PDFs, images and so on. Prompts over 20k characters are sent as a file automatically |
+| **Attachments** | `-a file` uploads code, PDFs, images, videos and so on. Prompts over 20k characters are sent as a file automatically |
+| **Generated images and videos** | When Gemini makes an image or video, it is saved at full size (`--out DIR`, or a new folder in the bridge home) and the file paths are listed after the answer |
 | **Share the conversation** | `--with-chat` attaches the current Claude Code chat: what you and Claude said, with tool output left out, secrets redacted and the oldest turns dropped past a size limit. The skill asks you before every request whether to include it. `--chat-preview` shows what would be sent |
 | **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …) in that folder. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
 | **Run checks** | `--allow-run "npm test"`: Neon may also run that command (plus extra args) to check its ideas. Off by default; only the prefixes you allow |
@@ -77,6 +78,7 @@ From a terminal:
 node bridge/neon.js ask "Explain the tradeoffs of optimistic vs pessimistic locking"
 node bridge/neon.js ask -s design "Here's my plan: ..."  &&  node bridge/neon.js ask -s design "What would you cut?"
 node bridge/neon.js ask -a report.pdf "Summarize the risks in this report"
+node bridge/neon.js ask --out ./art "Generate an image of a lighthouse in a storm"
 node bridge/neon.js ask --chat-preview "x"     # see what --with-chat would share from the current Claude Code chat
 node bridge/neon.js ask --agent ./my-repo "Find the most likely cause of the race condition in the job queue"
 node bridge/neon.js ask --agent ./my-repo --allow-run "npm test" --patch "Fix the failing date parser test"

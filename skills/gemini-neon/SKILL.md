@@ -33,6 +33,7 @@ Options:
 - `--run-timeout SEC`, per RUN command, default 300
 - `--patch` / `--patch-out PATH` (agent mode) asks for changes as a checked unified diff
 - `--with-chat` shares this conversation with Neon (see below); `--chat-preview` shows what would be shared and sends nothing; `--chat-max CHARS` (default 80000); `--chat-file PATH` uses another transcript
+- `--out DIR` saves generated images and videos there (default: a new folder in the bridge home)
 - `--json`
 
 ## Sharing this conversation: ask every time
@@ -49,6 +50,7 @@ Rules:
 
 Output and behavior:
 - The answer goes to stdout as markdown. Metadata goes to stderr: model, time, warnings and agent rounds.
+- Images and videos Gemini generates are saved automatically (full size for images) and listed after the answer under **Generated files**, and on stderr. With `--json` they are in `media: [{type, file, bytes}]`. Ask for them in plain words ("Generate an image of ..."). Image saving is tested; video saving is implemented but not yet verified against a real Gemini video. Image replies take about 30–70s; videos take minutes and the user's plan allows only a few per day, so generate videos only when the user asks. Show or hand over the saved files; do not describe them as if you had seen them unless you open them.
 - Exit codes: 0 ok, 2 not set up or signed out, 3 model not available on this plan, 4 timed out or partial answer, 1 other.
 - Prompts over 20k characters are sent automatically as an attached file.
 - Use a tool timeout of at least 300000 ms, or 600000 for agent mode. Long agent tasks can run in the background.

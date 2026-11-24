@@ -8,6 +8,7 @@
 //   POST /shutdown
 const http = require('http');
 const fs = require('fs');
+const path = require('path');
 const { spawn } = require('child_process');
 const cfg = require('./config');
 const { resolvePlaywright } = require('./deps');
@@ -161,6 +162,96 @@ function domToMarkdown() {
   return block(root).replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// ---------- generated images and videos ----------
+// Runs in the page: what the latest reply has generated so far.
+function countMedia() {
+  const r = [...document.querySelectorAll('model-response')].pop();
+  if (!r) return { images: 0, videos: 0, pending: 0 };
+  const imgs = [...r.querySelectorAll('generated-image img, single-image img')].filter(i => i.complete && i.naturalWidth > 64);
+  const vids = [...r.querySelectorAll('video')].filter(v => v.currentSrc || v.src || v.querySelector('source[src]'));
+  // Placeholders shown while an image or video is still being made.
+  const pending = r.querySelectorAll('generated-image:not(:has(img)), [class*="loading" i] video, generated-video:not(:has(video)), [aria-label*="generating" i]').length;
+  return { images: new Set(imgs.map(i => i.closest('generated-image, single-image') || i)).size, videos: vids.length, pending };
+}
+
+const extFor = type => ({ 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif', 'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov' })[String(type).split(';')[0]] || '';
+function uniquePath(dir, name) {
+  let f = path.join(dir, name), i = 1;
+  const { name: base, ext } = path.parse(name);
+  while (fs.existsSync(f)) f = path.join(dir, `${base}-${++i}${ext}`);
+  return f;
+}
+
+// Click a download button and wait for the browser to save the file into dir.
+async function viaDownloadButton(page, button, dir, timeoutMs = 120000) {
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'allowAndName', downloadPath: dir, eventsEnabled: true });
+    let name = null, guid = null;
+    const result = new Promise(res => {
+      const timer = setTimeout(() => res(null), timeoutMs);
+      cdp.on('Browser.downloadWillBegin', e => { if (!guid) { guid = e.guid; name = e.suggestedFilename; } });
+      cdp.on('Browser.downloadProgress', e => { if (e.guid === guid && e.state !== 'inProgress') { clearTimeout(timer); res(e.state === 'completed' ? e : null); } });
+    });
+    await button.click({ force: true });
+    const done = await result;
+    if (!done) return null;
+    const tmp = path.join(dir, guid), f = uniquePath(dir, (name || guid).replace(/[\\/:*?"<>|]/g, '_'));
+    fs.renameSync(tmp, f);
+    return f;
+  } finally {
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'default' }).catch(() => {});
+    await cdp.detach().catch(() => {});
+  }
+}
+
+// Fallback: read the media straight out of the page (display size for images).
+async function viaPage(page, handle, dir, label) {
+  const r = await handle.evaluate(async el => {
+    const toB64 = buf => { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
+    if (el.tagName === 'IMG') {
+      const c = document.createElement('canvas'); c.width = el.naturalWidth; c.height = el.naturalHeight;
+      c.getContext('2d').drawImage(el, 0, 0);
+      return { type: 'image/png', b64: c.toDataURL('image/png').split(',')[1] };
+    }
+    const src = el.currentSrc || el.src || (el.querySelector('source[src]') || {}).src;
+    const res = await fetch(src, { credentials: 'include' });
+    return { type: res.headers.get('content-type') || 'video/mp4', b64: toB64(await res.arrayBuffer()) };
+  });
+  const f = uniquePath(dir, label + extFor(r.type));
+  fs.writeFileSync(f, Buffer.from(r.b64, 'base64'));
+  return f;
+}
+
+async function saveMedia(page, dir, warnings) {
+  fs.mkdirSync(dir, { recursive: true });
+  await page.bringToFront();
+  const reply = (await page.locator('model-response').all()).pop();
+  const out = [];
+  const items = [
+    ...(await reply.locator('generated-image, single-image:not(generated-image single-image)').all()).map(c => ({ kind: 'image', c, el: c.locator('img').first() })),
+    ...(await reply.locator('video').all()).map(v => ({ kind: 'video', c: v.locator('xpath=ancestor::*[.//button[contains(translate(@aria-label,"DOWNLOAD","download"),"download")]][1]'), el: v })),
+  ];
+  let n = 0;
+  for (const it of items) {
+    n++;
+    let file = null;
+    try {
+      await it.el.hover({ timeout: 5000 }).catch(() => {});
+      const btn = it.c.locator('button[aria-label*="ownload" i]').first();
+      if (await btn.count()) file = await viaDownloadButton(page, btn, dir);
+    } catch (e) { log('media download button failed', e.message); }
+    if (!file) {
+      try {
+        file = await viaPage(page, await it.el.elementHandle(), dir, `gemini-${it.kind}-${n}`);
+        if (it.kind === 'image') warnings.push(`image ${n}: full-size download failed; saved the on-screen copy`);
+      } catch (e) { warnings.push(`${it.kind} ${n} could not be saved: ${e.message.split('\n')[0]}`); }
+    }
+    if (file) out.push({ type: it.kind, file, bytes: fs.statSync(file).size });
+  }
+  return out;
+}
+
 async function getSession(name, temp) {
   let s = sessions.get(name), warnings = [];
   if (!s) {
@@ -172,7 +263,7 @@ async function getSession(name, temp) {
   return { s, warnings };
 }
 
-async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEFAULT_MODEL, timeoutSec = 600 }) {
+async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEFAULT_MODEL, timeoutSec = 600, mediaDir }) {
   const t0 = Date.now();
   const name = session || ('_once_' + t0 + Math.random().toString(36).slice(2, 6));
   const { s, warnings } = await getSession(name, temp);
@@ -220,21 +311,30 @@ async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEF
       }
       await sleep(500);
     }
-    let last = '', stableSince = Date.now(), partial = false;
+    let last = '', stableSince = Date.now(), partial = false, media = { images: 0, videos: 0, pending: 0 };
     while (true) {
       if (Date.now() > deadline) { partial = true; warnings.push('timed out; answer may be partial'); break; }
       await sleep(1000);
       const txt = await page.evaluate(() => { const m = [...document.querySelectorAll('model-response message-content')].pop(); return m ? m.innerText : ''; });
+      media = await page.evaluate(countMedia);
       // Two independent "still generating" signals: the Stop button, and aria-busy on the reply.
-      const busy = (await page.locator(SEL.stop).count()) +
+      const busy = (await page.locator(SEL.stop).count()) + media.pending +
         (await page.evaluate(() => { const m = [...document.querySelectorAll('model-response message-content')].pop(); return m && m.querySelector('[aria-busy="true"]') ? 1 : 0; }));
-      if (txt !== last) { last = txt; stableSince = Date.now(); }
-      else if (txt && !busy && Date.now() - stableSince > 2000) break;
+      // An image or video reply can have no text at all, so generated media also counts as content.
+      const sig = txt + `|${media.images}|${media.videos}`;
+      if (sig !== last) { last = sig; stableSince = Date.now(); }
+      else if ((txt || media.images || media.videos) && !busy && Date.now() - stableSince > 2000) break;
     }
     const md = await page.evaluate(domToMarkdown);
+    let files = [];
+    if (media.images || media.videos) {
+      const dir = mediaDir || path.join(cfg.TMP, `media-${Date.now()}`);
+      files = await withUi(() => saveMedia(page, dir, warnings));
+    }
     s.turns++; s.lastUsed = Date.now(); s.url = page.url();
     if (session) saveStore();
-    return { ok: true, answer: md || last, session: session || null, url: s.temp ? null : s.url, model, warnings, partial, ms: Date.now() - t0 };
+    const text = md || last.replace(/\|\d+\|\d+$/, '');
+    return { ok: true, answer: text, media: files, session: session || null, url: s.temp ? null : s.url, model, warnings, partial, ms: Date.now() - t0 };
   } finally {
     s.busy = false;
     if (!session) { sessions.delete(name); await page.close().catch(() => {}); }
