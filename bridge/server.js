@@ -450,7 +450,7 @@ const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'applic
         const saved = Object.keys(stored).filter(k => !sessions.has(k)).map(k => ({ name: k, url: stored[k].url, turns: stored[k].turns, live: false }));
         return send(res, 200, [...live, ...saved]);
       }
-      if (req.method === 'GET' && req.url.startsWith('/result')) {
+      if (req.method === 'GET' && (req.url === '/result' || req.url.startsWith('/result?'))) {
         const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
         return send(res, 200, jobs.get(id));
       }
