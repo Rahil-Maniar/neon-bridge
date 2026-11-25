@@ -446,7 +446,7 @@ const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'applic
       if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true, sessions: [...sessions.keys()].filter(k => !k.startsWith('_')).length });
       if (req.method === 'GET' && req.url === '/sessions') {
         const stored = loadStore();
-        const live = [...sessions].filter(([k]) => !k.startsWith('_')).map(([k, v]) => ({ name: k, url: v.temp ? null : v.url, temp: v.temp, turns: v.turns, live: true }));
+        const live = [...sessions].filter(([k]) => !k.startsWith('_')).map(([k, v]) => ({ name: k, url: v.temp ? null : v.url, temp: v.temp, turns: v.turns, live: true, busy: !!v.busy }));
         const saved = Object.keys(stored).filter(k => !sessions.has(k)).map(k => ({ name: k, url: stored[k].url, turns: stored[k].turns, live: false }));
         return send(res, 200, [...live, ...saved]);
       }

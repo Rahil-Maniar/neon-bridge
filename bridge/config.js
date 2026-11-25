@@ -41,6 +41,7 @@ module.exports = {
   PROFILE: path.join(HOME, 'profile'),
   STORE: path.join(HOME, 'sessions.json'),
   RESULTS: path.join(HOME, 'results'),
+  SHARES: path.join(HOME, 'chat-shares.json'),
   LOG: path.join(HOME, 'daemon.log'),
   TMP: path.join(HOME, 'tmp'),
   CDP_PORT: num('NEON_CDP_PORT', 'cdpPort', 9333),

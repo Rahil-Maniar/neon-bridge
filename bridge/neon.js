@@ -5,12 +5,16 @@
 //   node neon.js doctor                        check browser, deps, sign-in and model access
 //   node neon.js ask [options] [prompt]        prompt from argument, --file, or stdin
 //     -s, --session NAME   multi-turn: the same NAME continues the conversation
+//                          (default inside Claude Code: one Gemini chat per Claude session)
+//     --fresh              start a new Gemini chat instead of continuing this Claude session's one
 //     -a, --attach PATH    attach a file (repeatable): code, pdf, images, ...
 //     --with-chat          share the current Claude Code conversation (what was said, not tool output;
 //                          secrets redacted; newest turns kept) as an attached file
 //     --chat-file PATH     share this transcript (.jsonl) instead of the current session's (implies --with-chat)
 //     --chat-max CHARS     size limit for the shared conversation (default 80000)
 //     --chat-preview       print what --with-chat would share, and send nothing
+//     --full-chat          share the whole conversation even if part of it was already shared
+//                          into this Gemini chat (by default only the new turns are sent)
 //     --agent ROOT         agent mode: the model can LIST/READ/GREP/FIND/DEFS/GIT under ROOT (read-only)
 //     --allow-run CMD      agent mode: also let it RUN this command prefix in ROOT (repeatable), e.g. "npm test"
 //     --run-timeout SEC    per-command limit for RUN (default 300)
@@ -128,6 +132,8 @@ function parseArgs(argv) {
     else if (a === '--chat-max') o.chatMax = +argv[++i];
     else if (a === '--chat-preview') { o.withChat = true; o.chatPreview = true; }
     else if (a === '--temp') o.temp = true;
+    else if (a === '--fresh') o.fresh = true;
+    else if (a === '--full-chat') { o.withChat = true; o.fullChat = true; }
     else if (a === '--save') o.temp = false; // the default; kept for older scripts
     else if (a === '--max-rounds') o.maxRounds = +argv[++i];
     else if (a === '--allow-run') (o.allowRun = o.allowRun || []).push(argv[++i]);
@@ -154,19 +160,40 @@ async function ask(o) {
   if ((o.allowRun || o.patch) && !o.agent) { err('--allow-run and --patch need --agent ROOT'); return 1; }
   if (o.agent && !fs.existsSync(o.agent)) { err('agent folder not found: ' + o.agent); return 1; }
   const tools = { allowRun: o.allowRun, runTimeoutSec: o.runTimeout, patch: o.patch };
-  let brief = null;
+  // Which Gemini chat: an explicit -s NAME; a new one per agent run; otherwise, inside Claude Code,
+  // one chat per Claude session so follow-ups continue where Neon left off (--fresh opts out).
+  const claudeId = process.env.CLAUDE_CODE_SESSION_ID;
+  let session = o.session, autoSession = false;
+  if (!session && o.agent) session = `_agent_${Date.now()}`;
+  else if (!session && !o.fresh && claudeId) { session = 'claude-' + claudeId.slice(0, 8); autoSession = true; }
+  if (!o.chatPreview) await ensureDaemon();
+  if (autoSession && (await daemonUp())) {
+    const live = await call('GET', '/sessions').catch(() => []);
+    if (live.some(x => x.name === session && x.busy)) { err(`this session's Neon chat is busy with another request; using a fresh chat`); session = undefined; autoSession = false; }
+  }
+
+  let brief = null, transcript = null;
+  const shares = chat.shareLog(cfg.SHARES);
   if (o.withChat) {
-    brief = chat.buildBrief(chat.findTranscript(o.chatFile), { maxChars: o.chatMax || 80000 });
-    err(`conversation: ${brief.turns} turns, ${brief.chars} chars` + (brief.omittedTurns ? `, ${brief.omittedTurns} older turns left out` : '') + `, ${brief.redactions} secret(s) redacted`);
+    transcript = chat.findTranscript(o.chatFile);
+    // Already shared into this same Gemini chat? Then send only what's new since.
+    let since = null;
+    const prev = session && !o.fullChat ? shares.get(session) : null;
+    if (prev && prev.transcript === transcript) {
+      let stored = {}; try { stored = JSON.parse(fs.readFileSync(cfg.STORE, 'utf8')); } catch {}
+      if (stored[session] && stored[session].url === prev.url) since = prev.lastTs;
+    }
+    brief = chat.buildBrief(transcript, { maxChars: o.chatMax || 80000, since });
+    if (brief.incremental) err(brief.turns ? `conversation: ${brief.turns} new turns since the last share in this chat, ${brief.chars} chars, ${brief.redactions} secret(s) redacted` : 'conversation: nothing new since the last share in this chat');
+    else err(`conversation: ${brief.turns} turns, ${brief.chars} chars` + (brief.omittedTurns ? `, ${brief.omittedTurns} older turns left out` : '') + `, ${brief.redactions} secret(s) redacted`);
     if (o.chatPreview) { process.stdout.write(brief.text + '\n'); return 0; }
   }
-  await ensureDaemon();
 
   const attach = [...o.attach];
-  if (brief) { // a fixed file name so the model can refer to it
+  if (brief && brief.turns) { // a fixed file name so the model can refer to it
     const dir = path.join(cfg.TMP, `chat-${Date.now()}`); fs.mkdirSync(dir, { recursive: true });
-    const f = path.join(dir, 'conversation.md'); fs.writeFileSync(f, brief.text); attach.push(f);
-    prompt = chat.chatPreamble + prompt;
+    const f = path.join(dir, brief.incremental ? 'conversation-update.md' : 'conversation.md'); fs.writeFileSync(f, brief.text); attach.push(f);
+    prompt = (brief.incremental ? chat.chatUpdatePreamble : chat.chatPreamble) + prompt;
   }
   const asFile = (text, label) => { const f = path.join(cfg.TMP, `${label}-${Date.now()}.md`); fs.writeFileSync(f, text); return f; };
   if (prompt.length > 20000) { // long prompts go up as an attached file
@@ -174,7 +201,6 @@ async function ask(o) {
     prompt = 'The full request is in the attached file ' + path.basename(f) + '. Read all of it and respond to it.';
   }
 
-  const session = o.session || (o.agent ? `_agent_${Date.now()}` : undefined);
   const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL, mediaDir: o.out, stallSec: o.stall };
   // Every request gets an id; the daemon keeps its answer, so it can be collected with
   // "result ID" if this process is killed (e.g. a background shell that ends with its session).
@@ -186,6 +212,9 @@ async function ask(o) {
     ? askD({ ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
     : askD({ ...base, prompt: msg });
   let r = await askD({ ...base, prompt: o.agent ? agent.agentPreamble(o.agent, tools) + prompt : prompt, attach });
+  // Remember how far the conversation was shared into this Gemini chat (saved chats only: a
+  // temporary chat can't be reopened, so the next share there must be a full one).
+  if (brief && brief.turns && session && r.ok && r.url) shares.set(session, { transcript, lastTs: brief.lastTs, url: r.url });
   const rounds = o.maxRounds || 12;
   let round = 0, fixes = 0, explanation = null, patch = null;
   while (o.agent && r.ok) {
