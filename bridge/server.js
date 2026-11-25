@@ -12,6 +12,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const cfg = require('./config');
 const { resolvePlaywright } = require('./deps');
+const { createJobs, shutdownCheck } = require('./jobs');
 
 const pw = resolvePlaywright();
 if (!pw) { console.error('playwright-core missing; run: node neon.js setup'); process.exit(1); }
@@ -67,34 +68,8 @@ const SEL = {
   abPick: 'This response is more helpful',
 };
 
-// ---------- request results (kept 48h, so an interrupted client can collect its answer) ----------
-const jobs = (() => {
-  const dir = cfg.RESULTS, running = new Set();
-  const file = id => path.join(dir, id.replace(/[^\w.-]/g, '_') + '.json');
-  const write = (id, data) => { try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file(id), JSON.stringify(data)); } catch (e) { log('result write failed', e.message); } };
-  const read = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
-  try { for (const f of fs.readdirSync(dir)) { const p = path.join(dir, f); if (Date.now() - fs.statSync(p).mtimeMs > 48 * 3600e3) fs.rmSync(p, { force: true }); } } catch {}
-  return {
-    start(id, body) { running.add(id); write(id, { id, status: 'running', startedAt: Date.now(), session: body.session || null, prompt: String(body.prompt || '').slice(0, 200) }); },
-    finish(id, result) { running.delete(id); const j = read(file(id)) || { id }; write(id, { ...j, status: 'done', finishedAt: Date.now(), result }); },
-    // Look up by exact id or id prefix (an agent run's rounds are "<id>.<n>"); the newest match wins.
-    get(id) {
-      if (!id) return { status: 'unknown', error: 'no id given' };
-      let hits = [];
-      try { hits = fs.readdirSync(dir).filter(f => f === `${id}.json` || f.startsWith(`${id}.`)).map(f => path.join(dir, f)); } catch {}
-      if (!hits.length) return { id, status: 'unknown' };
-      const j = read(hits.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0]) || { id, status: 'unknown' };
-      if (j.status === 'running' && !running.has(j.id)) j.status = 'lost'; // the daemon restarted mid-request
-      return j;
-    },
-    list() {
-      let out = [];
-      try { out = fs.readdirSync(dir).map(f => read(path.join(dir, f))).filter(Boolean); } catch {}
-      return out.map(j => ({ id: j.id, status: j.status === 'running' && !running.has(j.id) ? 'lost' : j.status, ok: j.result ? j.result.ok : null, session: j.session, startedAt: j.startedAt, prompt: (j.prompt || '').slice(0, 80) }))
-        .sort((a, b) => b.startedAt - a.startedAt).slice(0, 30);
-    },
-  };
-})();
+// Request results (kept 48h, so an interrupted client can collect its answer); see jobs.js.
+const jobs = createJobs(cfg.RESULTS, { log });
 
 class BridgeError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -472,8 +447,8 @@ const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'applic
       if (req.url === '/end') { await endSession(body.session); return send(res, 200, { ok: true }); }
       if (req.url === '/shutdown') {
         // Other Claude sessions may share this daemon; don't kill their requests unless forced.
-        const running = [...sessions.values()].filter(s => s.busy).length;
-        if (running && !body.force) return send(res, 409, { ok: false, code: 'BUSY', running, error: `${running} request(s) still running` });
+        const chk = shutdownCheck(sessions.values(), body.force);
+        if (!chk.ok) return send(res, 409, chk);
         send(res, 200, { ok: true }); return setTimeout(shutdown, 100);
       }
       send(res, 404, { ok: false, error: 'not found' });

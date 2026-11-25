@@ -106,7 +106,7 @@ Environment variables, or `config.json` in the bridge home:
 - `--with-chat` sends your conversation with Claude, minus tool output and with secret-looking values redacted. Redaction catches common key and token formats, not everything, so it stays opt-in and the skill asks you each time.
 - The daemon and the browser's debugging port listen on **127.0.0.1 only**. Note that any program running as you on the same machine could still talk to them.
 - Agent mode is read-only and confined to the folder you pass it, unless you add `--allow-run`. Allowed commands run in that folder with your permissions, and running a project's tests executes its code, so allow only specific commands (`npm test`, not `npm`) on projects you trust. Patches are only ever checked, never applied.
-- Tests for the agent tools: `npm test` (no browser or Google account needed).
+- Tests: `npm test` covers the agent tools, conversation sharing, the daemon's answer store and the CLI flow (against a fake daemon). They need no browser or Google account, and run on Windows, macOS and Linux for every pull request. The parts that drive the Gemini page itself are only checked live.
 
 ## Troubleshooting
 

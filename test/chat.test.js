@@ -1,5 +1,5 @@
 // Tests for --with-chat: turning a Claude Code transcript into a brief. No browser needed.
-const test = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
@@ -7,7 +7,7 @@ const path = require('path');
 const chat = require('../bridge/chat');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'neon-chat-'));
-test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 const user = (content, extra = {}) => ({ type: 'user', message: { role: 'user', content }, ...extra });
 const assistant = (...content) => ({ type: 'assistant', message: { role: 'assistant', content } });
