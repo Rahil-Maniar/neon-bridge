@@ -24,7 +24,8 @@ Claude Code ──skill──▶ neon.js (CLI) ──HTTP, localhost only──�
 |---|---|
 | **One-shot questions** | `neon.js ask "..."` |
 | **Multi-turn sessions** | `-s NAME` continues the same conversation, so Claude can push back and follow up |
-| **Attachments** | `-a file` uploads code, PDFs, images and so on. Prompts over 20k characters are sent as a file automatically |
+| **Attachments** | `-a file` uploads code, PDFs, images, videos and so on. Prompts over 20k characters are sent as a file automatically |
+| **Generated images and videos** | When Gemini makes an image or video, it is saved at full size (`--out DIR`, or a new folder in the bridge home) and the file paths are listed after the answer |
 | **Share the conversation** | `--with-chat` attaches the current Claude Code chat: what you and Claude said, with tool output left out, secrets redacted and the oldest turns dropped past a size limit. The skill asks you before every request whether to include it. `--chat-preview` shows what would be sent |
 | **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …) in that folder. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
 | **Run checks** | `--allow-run "npm test"`: Neon may also run that command (plus extra args) to check its ideas. Off by default; only the prefixes you allow |
@@ -77,10 +78,12 @@ From a terminal:
 node bridge/neon.js ask "Explain the tradeoffs of optimistic vs pessimistic locking"
 node bridge/neon.js ask -s design "Here's my plan: ..."  &&  node bridge/neon.js ask -s design "What would you cut?"
 node bridge/neon.js ask -a report.pdf "Summarize the risks in this report"
+node bridge/neon.js ask --out ./art "Generate an image of a lighthouse in a storm"
 node bridge/neon.js ask --chat-preview "x"     # see what --with-chat would share from the current Claude Code chat
 node bridge/neon.js ask --agent ./my-repo "Find the most likely cause of the race condition in the job queue"
 node bridge/neon.js ask --agent ./my-repo --allow-run "npm test" --patch "Fix the failing date parser test"
-node bridge/neon.js doctor | sessions | end NAME | status | stop [--force]
+node bridge/neon.js result ID     # collect an earlier answer (e.g. after an interrupted run); waits if still running
+node bridge/neon.js doctor | results | sessions | end NAME | status | stop [--force]
 ```
 Exit codes: `0` ok, `2` not set up or signed out, `3` model not available, `4` timed out or partial answer, `1` other.
 
@@ -110,7 +113,7 @@ Environment variables, or `config.json` in the bridge home:
 - **"Not set up" or "signed out":** run `setup` again.
 - **Model not available:** check that your plan includes it (open gemini.google.com and look at the model picker), then run `doctor`.
 - **It breaks after a Gemini redesign:** the page selectors are in the `SEL` object in `bridge/server.js`. `node bridge/server.js --show` runs the daemon with a visible window, and `bridge/dev/inspect.js` dumps the page's controls. PRs welcome.
-- **Hangs:** run `stop --force` and try again. Logs are in `~/.neon-bridge/daemon.log`.
+- **Hangs:** the bridge resends a prompt once if Gemini has not started replying after 90s (`--stall SEC`, `0` = off). The daemon is shared by everything on your machine that uses neon-bridge, so `stop` refuses while requests are running; `stop --force` stops it anyway. An interrupted request can still be collected with `result ID`. Logs are in `~/.neon-bridge/daemon.log`.
 
 ## License
 
