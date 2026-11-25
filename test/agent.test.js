@@ -1,5 +1,5 @@
 // Tests for the agent-mode tools. They run against a throwaway git repo and need no browser.
-const test = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
@@ -12,7 +12,7 @@ const git = (...a) => execFileSync('git', a, { cwd: root, stdio: ['ignore', 'pip
 const write = (f, s) => { fs.mkdirSync(path.dirname(path.join(root, f)), { recursive: true }); fs.writeFileSync(path.join(root, f), s); };
 const run = (line, opts) => agent.runTool(root, line, opts);
 
-test.before(() => {
+before(() => {
   write('src/app.js', [
     'const helper = (x) => x + 1;',
     'function handleRequest(req) {',
@@ -31,7 +31,7 @@ test.before(() => {
   git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'add', '-A');
   git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'initial');
 });
-test.after(() => fs.rmSync(root, { recursive: true, force: true }));
+after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 test('tokenize honors quotes', async () => {
   assert.deepStrictEqual(agent.tokenize(`npm test -- -t "my test" 'a b'`), ['npm', 'test', '--', '-t', 'my test', 'a b']);

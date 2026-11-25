@@ -60,7 +60,10 @@ function toolLine(b) {
 }
 
 // Returns {text, turns, chars, redactions, omittedTurns}.
-function buildBrief(file, { maxChars = 80000, tools = true } = {}) {
+// since: an ISO timestamp; only entries after it are included (for a follow-up share in the same
+// Gemini chat, so Neon gets just what's new). lastTs in the result is the newest entry's timestamp.
+function buildBrief(file, { maxChars = 80000, tools = true, since = null } = {}) {
+  let lastTs = since || '';
   const turns = []; // {who, parts[]}
   // parts are strings (text) or arrays (a run of tool uses, shown as one line)
   const push = (who, line, isTool = false) => {
@@ -73,6 +76,8 @@ function buildBrief(file, { maxChars = 80000, tools = true } = {}) {
     if (!raw.trim()) continue;
     let o; try { o = JSON.parse(raw); } catch { continue; }
     if (o.isSidechain || o.isMeta || !o.message) continue;
+    if (o.timestamp && o.timestamp > lastTs) lastTs = o.timestamp;
+    if (since && !(o.timestamp > since)) continue;
     const c = o.message.content;
     if (o.type === 'user') {
       if (o.isCompactSummary) { push('summary', stripInjected(typeof c === 'string' ? c : (c || []).filter(b => b.type === 'text').map(b => b.text).join('\n'))); continue; }
@@ -96,11 +101,24 @@ function buildBrief(file, { maxChars = 80000, tools = true } = {}) {
     size += blocks[i].length + 2;
   }
   const omitted = blocks.length - kept.length;
-  const body = (omitted ? `_(${omitted} earlier turns omitted for length)_\n\n` : '') + kept.join('\n\n');
+  if (!kept.length) return { text: '', turns: 0, chars: 0, redactions: 0, omittedTurns: 0, lastTs, incremental: !!since };
+  const body = (since ? '_(Continues the conversation shared earlier in this chat: only the turns since then are below.)_\n\n' : '') +
+    (omitted ? `_(${omitted} earlier turns omitted for length)_\n\n` : '') + kept.join('\n\n');
   const { text, count } = redact(body);
-  return { text, turns: kept.length, chars: text.length, redactions: count, omittedTurns: omitted };
+  return { text, turns: kept.length, chars: text.length, redactions: count, omittedTurns: omitted, lastTs, incremental: !!since };
 }
 
 const chatPreamble = 'For context, the attached file conversation.md is the conversation so far between me (the user) and Claude, another AI assistant I am working with. Lines like _[Tools used: ...]_ list tools Claude ran; their output is not included. Use it as background; the request below is what I need from you now.\n\n';
+const chatUpdatePreamble = 'The attached file conversation-update.md continues the conversation between me and Claude that I shared earlier in this chat: it has only what was said since then. Use it as background; the request below is what I need from you now.\n\n';
 
-module.exports = { findTranscript, buildBrief, redact, chatPreamble };
+// Remembers, per bridge session, which Gemini chat got the conversation and up to when,
+// so a later --with-chat in the same Gemini chat only sends what's new.
+function shareLog(file) {
+  const load = () => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; } };
+  return {
+    get: session => load()[session] || null,
+    set(session, entry) { const all = load(); all[session] = entry; try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(all, null, 1)); } catch {} },
+  };
+}
+
+module.exports = { findTranscript, buildBrief, redact, chatPreamble, chatUpdatePreamble, shareLog };

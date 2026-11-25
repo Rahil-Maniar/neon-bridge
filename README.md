@@ -23,10 +23,10 @@ Claude Code ──skill──▶ neon.js (CLI) ──HTTP, localhost only──�
 | | |
 |---|---|
 | **One-shot questions** | `neon.js ask "..."` |
-| **Multi-turn sessions** | `-s NAME` continues the same conversation, so Claude can push back and follow up |
+| **Multi-turn sessions** | Inside Claude Code, each Claude session gets its own Gemini chat, so follow-ups continue where Neon left off (`--fresh` for a new one). `-s NAME` keeps a separate named thread |
 | **Attachments** | `-a file` uploads code, PDFs, images, videos and so on. Prompts over 20k characters are sent as a file automatically |
 | **Generated images and videos** | When Gemini makes an image or video, it is saved at full size (`--out DIR`, or a new folder in the bridge home) and the file paths are listed after the answer |
-| **Share the conversation** | `--with-chat` attaches the current Claude Code chat: what you and Claude said, with tool output left out, secrets redacted and the oldest turns dropped past a size limit. The skill asks you before every request whether to include it. `--chat-preview` shows what would be sent |
+| **Share the conversation** | `--with-chat` attaches the current Claude Code chat: what you and Claude said, with tool output left out, secrets redacted and the oldest turns dropped past a size limit. The skill asks you before every request whether to include it. `--chat-preview` shows what would be sent. Sharing again into the same Gemini chat sends only the new turns |
 | **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …) in that folder. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
 | **Run checks** | `--allow-run "npm test"`: Neon may also run that command (plus extra args) to check its ideas. Off by default; only the prefixes you allow |
 | **Patches** | `--patch`: Neon proposes changes as a unified diff. It is checked with `git apply --check`, saved to a file, never applied, and sent back to Neon if it doesn't apply |
@@ -106,7 +106,7 @@ Environment variables, or `config.json` in the bridge home:
 - `--with-chat` sends your conversation with Claude, minus tool output and with secret-looking values redacted. Redaction catches common key and token formats, not everything, so it stays opt-in and the skill asks you each time.
 - The daemon and the browser's debugging port listen on **127.0.0.1 only**. Note that any program running as you on the same machine could still talk to them.
 - Agent mode is read-only and confined to the folder you pass it, unless you add `--allow-run`. Allowed commands run in that folder with your permissions, and running a project's tests executes its code, so allow only specific commands (`npm test`, not `npm`) on projects you trust. Patches are only ever checked, never applied.
-- Tests for the agent tools: `npm test` (no browser or Google account needed).
+- Tests: `npm test` covers the agent tools, conversation sharing, the daemon's answer store and the CLI flow (against a fake daemon). They need no browser or Google account, and run on Windows, macOS and Linux for every pull request. The parts that drive the Gemini page itself are only checked live.
 
 ## Troubleshooting
 

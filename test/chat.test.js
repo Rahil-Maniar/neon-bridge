@@ -1,5 +1,5 @@
 // Tests for --with-chat: turning a Claude Code transcript into a brief. No browser needed.
-const test = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
@@ -7,7 +7,7 @@ const path = require('path');
 const chat = require('../bridge/chat');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'neon-chat-'));
-test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 const user = (content, extra = {}) => ({ type: 'user', message: { role: 'user', content }, ...extra });
 const assistant = (...content) => ({ type: 'assistant', message: { role: 'assistant', content } });
@@ -88,4 +88,36 @@ test('finds the current session transcript from the environment', () => {
   } finally {
     for (const [k, v] of [['CLAUDE_CODE_SESSION_ID', saved.id], ['CLAUDE_CONFIG_DIR', saved.cfg]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
+});
+
+test('since: a follow-up share contains only newer turns', () => {
+  const at = (n, l) => ({ ...l, timestamp: `2026-11-25T10:00:0${n}.000Z` });
+  const f = transcript('incremental', [
+    at(1, user('first question')), at(2, assistant(text('first answer'))),
+    at(3, user('second question')), at(4, assistant(text('second answer'))),
+  ]);
+  const full = chat.buildBrief(f);
+  assert.strictEqual(full.incremental, false);
+  assert.strictEqual(full.lastTs, '2026-11-25T10:00:04.000Z');
+  assert.match(full.text, /first question/);
+
+  const upd = chat.buildBrief(f, { since: '2026-11-25T10:00:02.000Z' });
+  assert.strictEqual(upd.incremental, true);
+  assert.ok(!upd.text.includes('first'), 'already-shared turns are left out');
+  assert.match(upd.text, /^_\(Continues the conversation shared earlier/);
+  assert.match(upd.text, /second question[\s\S]*second answer/);
+  assert.strictEqual(upd.lastTs, '2026-11-25T10:00:04.000Z');
+
+  const none = chat.buildBrief(f, { since: '2026-11-25T10:00:04.000Z' });
+  assert.strictEqual(none.turns, 0);
+  assert.strictEqual(none.text, '');
+});
+
+test('shareLog remembers what was shared per session', () => {
+  const log = chat.shareLog(path.join(dir, 'state', 'shares.json'));
+  assert.strictEqual(log.get('claude-abc'), null);
+  log.set('claude-abc', { transcript: 't.jsonl', lastTs: 'x', url: 'https://gemini.google.com/app/1' });
+  log.set('other', { transcript: 'u.jsonl', lastTs: 'y', url: 'u' });
+  assert.deepStrictEqual(log.get('claude-abc'), { transcript: 't.jsonl', lastTs: 'x', url: 'https://gemini.google.com/app/1' });
+  assert.strictEqual(log.get('other').lastTs, 'y');
 });
