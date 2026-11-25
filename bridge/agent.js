@@ -5,41 +5,38 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
-const DENY = [/(^|[\\/])\.env(\..*)?$/i, /\.(pem|key|p12|pfx|keystore|jks|kdbx)$/i, /(^|[\\/])id_(rsa|ed25519|ecdsa|dsa)/i,
-  /credentials?(\.json)?$/i, /(^|[\\/])secrets?(\.|[\\/]|$)/i, /(^|[\\/])\.git[\\/]/i, /(^|[\\/])\.(npmrc|netrc|pypirc)$/i,
-  /(^|[\\/])\.(ssh|aws|gnupg|docker|kube)[\\/]/i];
-const SKIP_DIRS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist', 'build', '.next', '.cache', 'target', 'bin', 'obj', '.neon-bridge']);
+const { createWorkspace, redactSecrets, denied } = require('./workspace');
 const MAX_OUT = 60000;
 const TOOL_NAMES = ['READ', 'LIST', 'GREP', 'FIND', 'DEFS', 'GIT', 'RUN'];
-const denied = p => DENY.some(r => r.test(p));
 
-function resolveIn(root, p) {
-  const full = path.resolve(root, p || '.');
-  const rel = path.relative(root, full);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('outside the allowed folder');
-  if (denied(full)) throw new Error('denied (sensitive file)');
-  return full;
-}
-let walked = 0;
-function* walk(dir, depth = 0, maxDepth = 12) {
-  if (depth === 0) walked = 0;
-  if (++walked > 20000) return;
-  let ents = []; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const e of ents) {
-    const f = path.join(dir, e.name);
-    if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name) && depth < maxDepth) { yield { f, dir: true, depth }; yield* walk(f, depth + 1, maxDepth); } }
-    else yield { f, dir: false, depth };
-  }
-}
+// Older callers pass a folder path; turn it into a (cached) one-folder workspace.
+const wsCache = new Map();
+const asWorkspace = w => {
+  if (typeof w !== 'string') return w;
+  if (!wsCache.has(w)) wsCache.set(w, createWorkspace([{ dir: w }]));
+  return wsCache.get(w);
+};
 const isText = f => { try { return !fs.readFileSync(f).subarray(0, 4096).includes(0); } catch { return false; } };
 
-// Text files under dir that are safe to search, as [relPath, lines].
-function* searchable(root, dir) {
-  for (const e of walk(dir)) {
-    if (e.dir || denied(e.f)) continue;
-    try { if (fs.statSync(e.f).size > 2e6 || !isText(e.f)) continue; } catch { continue; }
-    yield [path.relative(root, e.f), fs.readFileSync(e.f, 'utf8').split(/\r?\n/)];
+// Visible text files under the given folders, as [shownPath, lines, file].
+function* searchable(ws, targets) {
+  for (const t of targets) {
+    const items = fs.statSync(t.dir).isDirectory() ? ws.walk(t.root, t.dir) : [{ f: t.dir, dir: false }];
+    for (const e of items) {
+      if (e.dir) continue;
+      try { if (fs.statSync(e.f).size > 2e6 || !isText(e.f)) continue; } catch { continue; }
+      yield [ws.show(t.root, e.f), fs.readFileSync(e.f, 'utf8').split(/\r?\n/), e.f];
+    }
   }
+}
+
+// With several folders, GIT and RUN name the folder first ("GIT frontend log -n 5").
+function pickRoot(ws, arg) {
+  if (!ws.multi) return { root: ws.roots[0], rest: arg };
+  const m = arg.match(/^(\S+)\s*([\s\S]*)$/) || [];
+  const root = ws.roots.find(r => r.name.toLowerCase() === String(m[1] || '').toLowerCase());
+  if (!root) throw new Error(`name the folder first, one of: ${ws.roots.map(r => r.name).join(', ')}`);
+  return { root, rest: m[2] || '' };
 }
 
 // Split a command line into args, honoring "double" and 'single' quotes.
@@ -88,7 +85,7 @@ function runGit(root, arg) {
   const r = spawnSync('git', ['--no-pager', '-c', 'color.ui=never', '-c', 'core.quotepath=off', ...args],
     { cwd: root, encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024, input: '', windowsHide: true });
   if (r.error) return 'ERROR: ' + (r.error.code === 'ENOENT' ? 'git is not installed' : r.error.message);
-  let out = filterDiff((r.stdout || '') + (r.stderr ? (r.stdout ? '\n' : '') + r.stderr : ''));
+  let out = redactSecrets(filterDiff((r.stdout || '') + (r.stderr ? (r.stdout ? '\n' : '') + r.stderr : ''))).text;
   if (r.status !== 0) out = `(exit ${r.status})\n` + out;
   return clip(out.trimEnd()) || '(no output)';
 }
@@ -126,7 +123,7 @@ function runCommand(root, arg, opts) {
     const timer = setTimeout(() => { timedOut = true; killTree(); grace = setTimeout(() => finish(report(null)), 5000); }, timeout);
     const secs = () => ((Date.now() - t0) / 1000).toFixed(1);
     const report = code => {
-      const out = (stdout + (stderr ? '\n--- stderr ---\n' + stderr : '')).replace(/\x1b\[[0-9;]*m/g, '').trimEnd();
+      const out = redactSecrets((stdout + (stderr ? '\n--- stderr ---\n' + stderr : '')).replace(/\x1b\[[0-9;]*m/g, '').trimEnd(), 'output.log').text;
       return timedOut ? `ERROR: timed out after ${secs()}s\n` + clip(out) : `(exit ${code}, ${secs()}s)\n` + (clip(out) || '(no output)');
     };
     child.on('error', e => finish('ERROR: ' + (e.code === 'ENOENT' ? `command not found: ${argv[0]}` : e.message)));
@@ -148,26 +145,40 @@ function defsRegex(name) {
   ].join('|'));
 }
 
-async function runTool(root, line, opts = {}) {
+async function runTool(workspace, line, opts = {}) {
   const m = line.trim().match(new RegExp(`^(${TOOL_NAMES.join('|')})\\b\\s*(.*)$`, 'i'));
   if (!m) return `ERROR: unknown command "${line.trim()}"`;
   const cmd = m[1].toUpperCase(), arg = m[2].trim();
   try {
+    const ws = asWorkspace(workspace);
     if (cmd === 'READ') {
       const mm = arg.match(/^(.+?)(?:\s+(\d+)\s*[-:]\s*(\d+))?$/);
       if (!mm) return 'ERROR: usage: READ <file> [a-b]';
-      const rel = mm[1].replace(/^["']|["']$/g, ''), f = resolveIn(root, rel);
-      if (!isText(f)) return 'ERROR: binary or unreadable file';
-      const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/);
+      const r = ws.resolve(mm[1], { allowRoot: false });
+      if (r.isDir) return 'ERROR: that is a folder; use LIST';
+      if (!isText(r.full)) return 'ERROR: binary or unreadable file';
+      const lines = fs.readFileSync(r.full, 'utf8').split(/\r?\n/);
       const a = mm[2] ? Math.max(1, +mm[2]) : 1, b = mm[3] ? Math.min(lines.length, +mm[3]) : Math.min(lines.length, a + 799);
-      let out = lines.slice(a - 1, b).map((l, i) => `${a + i}\t${l}`).join('\n');
-      if (b < lines.length) out += `\n... (${lines.length} lines total; READ ${rel} ${b + 1}-${Math.min(lines.length, b + 800)} for more)`;
+      // Redact before numbering the lines, so patterns that start at the beginning of a line still match.
+      const red = redactSecrets(lines.slice(a - 1, b).join('\n'), r.full);
+      let out = red.text.split('\n').map((l, i) => `${a + i}\t${l}`).join('\n');
+      if (b < lines.length) out += `\n... (${lines.length} lines total; READ ${ws.show(r.root, r.full)} ${b + 1}-${Math.min(lines.length, b + 800)} for more)`;
+      if (red.count) out += `\n(${red.count} value(s) that looked like credentials were redacted)`;
       return out;
     }
     if (cmd === 'LIST') {
       const mm = arg.match(/^(.*?)(?:\s+depth=(\d+))?$/);
-      const d = resolveIn(root, mm[1] || '.'), maxD = mm[2] ? +mm[2] : 2, out = [];
-      for (const e of walk(d, 0, maxD - 1)) { out.push('  '.repeat(e.depth) + path.basename(e.f) + (e.dir ? '/' : '')); if (out.length >= 400) { out.push('... (truncated)'); break; } }
+      const maxD = mm[2] ? +mm[2] : 2, out = [], p = mm[1] || '.';
+      if (ws.multi && (p === '.' || p === '')) { // several folders: show each one's top levels
+        for (const root of ws.roots) {
+          out.push(root.name + '/');
+          for (const e of ws.walk(root, root.dir, maxD - 2)) { out.push('  '.repeat(e.depth + 1) + path.basename(e.f) + (e.dir ? '/' : '')); if (out.length >= 400) break; }
+          if (out.length >= 400) { out.push('... (truncated)'); break; }
+        }
+        return out.join('\n') || '(empty)';
+      }
+      const r = ws.resolve(p);
+      for (const e of ws.walk(r.root, r.full, maxD - 1)) { out.push('  '.repeat(e.depth) + path.basename(e.f) + (e.dir ? '/' : '')); if (out.length >= 400) { out.push('... (truncated)'); break; } }
       return out.join('\n') || '(empty)';
     }
     if (cmd === 'GREP') {
@@ -175,45 +186,54 @@ async function runTool(root, line, opts = {}) {
       const cm = a.match(/\s+context=(\d+)\s*$/); if (cm) { ctx = Math.min(5, +cm[1]); a = a.slice(0, cm.index); }
       const mm = a.match(/^\/(.+)\/([a-z]*)\s*(.*)$/) || a.match(/^(\S+)()\s*(.*)$/);
       if (!mm) return 'ERROR: usage: GREP /regex/[i] [dir] [context=N]';
-      const re = new RegExp(mm[1], (mm[2] || '').replace(/[^imsu]/g, '')), d = resolveIn(root, mm[3] || '.'), out = [];
-      let hits = 0;
-      outer: for (const [rel, lines] of searchable(root, d)) {
+      const re = new RegExp(mm[1], (mm[2] || '').replace(/[^imsu]/g, '')), out = [];
+      let hits = 0, redacted = 0;
+      outer: for (const [shown, lines, file] of searchable(ws, ws.targets(mm[3]))) {
         let shownTo = -1;
+        const emit = (j, mark) => { const r = redactSecrets(lines[j].slice(0, 240), file); redacted += r.count; out.push(`${shown}:${j + 1}${mark} ${r.text}`); };
         for (let i = 0; i < lines.length; i++) {
           if (!re.test(lines[i])) continue;
           if (++hits > 150) { out.push('... (truncated at 150 matches)'); break outer; }
-          if (!ctx) { out.push(`${rel}:${i + 1}: ${lines[i].slice(0, 240)}`); continue; }
+          if (!ctx) { emit(i, ':'); continue; }
           const from = Math.max(0, i - ctx, shownTo + 1), to = Math.min(lines.length - 1, i + ctx);
           if (from > shownTo + 1 && out.length) out.push('--');
-          for (let j = from; j <= to; j++) out.push(`${rel}:${j + 1}${j === i ? ':' : '-'} ${lines[j].slice(0, 240)}`);
+          for (let j = from; j <= to; j++) emit(j, j === i ? ':' : '-');
           shownTo = to;
         }
       }
+      if (redacted) out.push(`(${redacted} value(s) that looked like credentials were redacted)`);
       return out.join('\n') || '(no matches)';
     }
     if (cmd === 'FIND') {
       const needle = arg.toLowerCase().replace(/\*/g, ''), out = [];
-      for (const e of walk(root)) { if (path.basename(e.f).toLowerCase().includes(needle)) out.push(path.relative(root, e.f) + (e.dir ? '/' : '')); if (out.length >= 200) break; }
+      for (const root of ws.roots) for (const e of ws.walk(root, root.dir)) {
+        if (path.basename(e.f).toLowerCase().includes(needle)) out.push(ws.show(root, e.f) + (e.dir ? '/' : ''));
+        if (out.length >= 200) return out.join('\n');
+      }
       return out.join('\n') || '(nothing found)';
     }
     if (cmd === 'DEFS') {
       const mm = arg.match(/^(\S+)\s*(.*)$/);
       if (!mm) return 'ERROR: usage: DEFS <name> [dir]';
-      const re = defsRegex(mm[1]), d = resolveIn(root, mm[2] || '.'), out = [];
-      for (const [rel, lines] of searchable(root, d)) {
-        lines.forEach((l, i) => { if (out.length < 100 && re.test(l)) out.push(`${rel}:${i + 1}: ${l.trim().slice(0, 240)}`); });
+      const re = defsRegex(mm[1]), out = [];
+      for (const [shown, lines, file] of searchable(ws, ws.targets(mm[2]))) {
+        lines.forEach((l, i) => { if (out.length < 100 && re.test(l)) out.push(`${shown}:${i + 1}: ${redactSecrets(l.trim().slice(0, 240), file).text}`); });
         if (out.length >= 100) { out.push('... (truncated at 100)'); break; }
       }
       return out.join('\n') || `(no definition of "${mm[1]}" found; try GREP)`;
     }
-    if (cmd === 'GIT') return runGit(root, arg);
-    if (cmd === 'RUN') return await runCommand(root, arg, opts);
+    if (cmd === 'GIT') { const { root, rest } = pickRoot(ws, arg); return runGit(root.dir, rest); }
+    if (cmd === 'RUN') { const { root, rest } = pickRoot(ws, arg); return await runCommand(root.dir, rest, opts); }
   } catch (e) { return 'ERROR: ' + e.message; }
 }
 
-function agentPreamble(root, opts = {}) {
+function agentPreamble(workspace, opts = {}) {
+  const ws = asWorkspace(workspace);
   const run = (opts.allowRun || []).length;
-  return `You are working as a careful engineering assistant with access to a folder on my computer (the "workspace", root = ${root}). You cannot see it unless you ask. ${run ? 'You can read anything and run a few allowed commands, but you cannot edit files.' : 'Your access is read-only.'}
+  const where = ws.multi
+    ? `several folders on my computer (the "workspace"): ${ws.roots.map(r => '`' + r.name + '/`').join(', ')}. Paths start with the folder name (e.g. \`${ws.roots[1].name}/README.md\`); GIT${run ? ' and RUN' : ''} take the folder name first (e.g. \`GIT ${ws.roots[0].name} log --oneline -n 10\`)`
+    : `a folder on my computer (the "workspace", root = ${ws.roots[0].dir})`;
+  return `You are working as a careful engineering assistant with access to ${where}. You cannot see it unless you ask. ${run ? 'You can read anything and run a few allowed commands, but you cannot edit files.' : 'Your access is read-only.'} Only files that are part of the project are visible: data files and secrets are hidden, and values that look like credentials show as [REDACTED].
 
 To use a tool, reply with ONLY a fenced block like this and nothing else, then stop and wait:
 \`\`\`neon-tools
@@ -273,20 +293,61 @@ function patchPaths(patch) {
   return [...set];
 }
 
-// Check (never apply) a patch against ROOT. Returns {ok, strip, error}.
-function checkPatch(root, patch, file) {
-  for (const p of patchPaths(patch)) {
-    try { resolveIn(root, p); } catch (e) { return { ok: false, error: `${p}: ${e.message}` }; }
-  }
-  fs.writeFileSync(file, patch);
+// Split a unified diff into per-file sections: [{ path, text }].
+function patchSections(patch) {
+  const lines = patch.split('\n'), out = [];
+  const hasGitHeaders = lines.some(l => l.startsWith('diff --git '));
+  let cur = null;
+  lines.forEach((l, i) => {
+    const starts = hasGitHeaders ? l.startsWith('diff --git ') : (l.startsWith('--- ') && (lines[i + 1] || '').startsWith('+++ '));
+    if (starts) out.push(cur = { lines: [] });
+    if (cur) cur.lines.push(l);
+  });
+  return out.map(s => {
+    const text = s.lines.join('\n').replace(/\n*$/, '\n');
+    const p = patchPaths(text).find(x => x) || '';
+    return { path: p, text };
+  });
+}
+
+function gitApplyCheck(dir, file, strips) {
   let firstErr = '';
-  for (const strip of [1, 0]) {
-    const r = spawnSync('git', ['apply', '--check', '--recount', '--ignore-whitespace', `-p${strip}`, file], { cwd: root, encoding: 'utf8', timeout: 30000, windowsHide: true });
+  for (const strip of strips) {
+    const r = spawnSync('git', ['apply', '--check', '--recount', '--ignore-whitespace', `-p${strip}`, file], { cwd: dir, encoding: 'utf8', timeout: 30000, windowsHide: true });
     if (r.error) return { ok: null, error: r.error.code === 'ENOENT' ? 'git is not installed, so the patch could not be checked' : r.error.message };
     if (r.status === 0) return { ok: true, strip };
-    if (strip === 1) firstErr = (r.stderr || r.stdout || '').trim();
+    if (!firstErr) firstErr = (r.stderr || r.stdout || '').trim();
   }
   return { ok: false, error: firstErr || 'git apply --check failed' };
+}
+
+// Check (never apply) a patch against the workspace. Returns {ok, strip, error, parts}.
+// With several folders, paths start with the folder name and each folder's part is checked (and
+// saved) separately: parts = [{ root, dir, file, strip }].
+function checkPatch(workspace, patch, file) {
+  const ws = asWorkspace(workspace);
+  for (const p of patchPaths(patch)) {
+    try { ws.resolve(p, { allowRoot: false }); } catch (e) { return { ok: false, error: `${p}: ${e.message}` }; }
+  }
+  fs.writeFileSync(file, patch);
+  if (!ws.multi) return gitApplyCheck(ws.roots[0].dir, file, [1, 0]);
+  const groups = new Map();
+  for (const s of patchSections(patch)) {
+    const name = s.path.split(/[\\/]/)[0].toLowerCase();
+    const root = ws.roots.find(r => r.name.toLowerCase() === name);
+    if (!root) return { ok: false, error: `${s.path}: paths must start with a folder name (${ws.roots.map(r => r.name).join(', ')})` };
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(s.text);
+  }
+  const parts = [];
+  for (const [root, texts] of groups) {
+    const partFile = file.replace(/(\.[^.\\/]*)?$/, `.${root.name}$1`);
+    fs.writeFileSync(partFile, texts.join(''));
+    const r = gitApplyCheck(root.dir, partFile, [2, 1]); // a/<folder>/path or <folder>/path
+    if (!r.ok) return { ...r, error: `${root.name}: ${r.error}` };
+    parts.push({ root: root.name, dir: root.dir, file: partFile, strip: r.strip });
+  }
+  return { ok: true, strip: null, parts };
 }
 
 module.exports = { runTool, agentPreamble, extractTools, extractPatch, checkPatch, patchPaths, tokenize, MAX_OUT };

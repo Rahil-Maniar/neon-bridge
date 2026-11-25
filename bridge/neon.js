@@ -15,7 +15,12 @@
 //     --chat-preview       print what --with-chat would share, and send nothing
 //     --full-chat          share the whole conversation even if part of it was already shared
 //                          into this Gemini chat (by default only the new turns are sent)
-//     --agent ROOT         agent mode: the model can LIST/READ/GREP/FIND/DEFS/GIT under ROOT (read-only)
+//     --agent [NAME=]DIR   agent mode: the model can LIST/READ/GREP/FIND/DEFS/GIT under DIR (read-only).
+//                          Repeat it to give several folders (each appears as NAME/, default: the folder's name).
+//                          In git repos, git-ignored files are hidden; data files are hidden; credential-like
+//                          values are redacted
+//     --include-data       agent mode: also show data files (csv, xlsx, sqlite, dumps, upload folders)
+//     --all-files          agent mode: also show files git ignores
 //     --allow-run CMD      agent mode: also let it RUN this command prefix in ROOT (repeatable), e.g. "npm test"
 //     --run-timeout SEC    per-command limit for RUN (default 300)
 //     --patch              agent mode: ask for changes as a unified diff; it is checked, never applied,
@@ -43,6 +48,7 @@ const { spawn } = require('child_process');
 const cfg = require('./config');
 const { ensurePlaywright, resolvePlaywright } = require('./deps');
 const chat = require('./chat');
+const workspace = require('./workspace');
 const agent = require('./agent');
 
 const err = (...m) => process.stderr.write('[neon] ' + m.join(' ') + '\n');
@@ -125,7 +131,9 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '-s' || a === '--session') o.session = argv[++i];
     else if (a === '-a' || a === '--attach') o.attach.push(path.resolve(argv[++i]));
-    else if (a === '--agent') o.agent = path.resolve(argv[++i]);
+    else if (a === '--agent') { (o.agents = o.agents || []).push(workspace.parseAgentArg(argv[++i])); o.agent = true; }
+    else if (a === '--include-data') o.includeData = true;
+    else if (a === '--all-files') o.allFiles = true;
     else if (a === '--model') o.model = argv[++i];
     else if (a === '--with-chat') o.withChat = true;
     else if (a === '--chat-file') { o.withChat = true; o.chatFile = path.resolve(argv[++i]); }
@@ -158,7 +166,12 @@ async function ask(o) {
   if (!prompt) { err('empty prompt'); return 1; }
   for (const f of o.attach) if (!fs.existsSync(f)) { err('attachment not found: ' + f); return 1; }
   if ((o.allowRun || o.patch) && !o.agent) { err('--allow-run and --patch need --agent ROOT'); return 1; }
-  if (o.agent && !fs.existsSync(o.agent)) { err('agent folder not found: ' + o.agent); return 1; }
+  let ws = null;
+  if (o.agents) {
+    try { ws = workspace.createWorkspace(o.agents, { trackedOnly: !o.allFiles, includeData: !!o.includeData }); }
+    catch (e) { err(e.message); return 1; }
+    err('workspace: ' + ws.summary());
+  }
   const tools = { allowRun: o.allowRun, runTimeoutSec: o.runTimeout, patch: o.patch };
   // Which Gemini chat: an explicit -s NAME; a new one per agent run; otherwise, inside Claude Code,
   // one chat per Claude session so follow-ups continue where Neon left off (--fresh opts out).
@@ -211,7 +224,7 @@ async function ask(o) {
   const send = (msg, label) => msg.length > 20000
     ? askD({ ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
     : askD({ ...base, prompt: msg });
-  let r = await askD({ ...base, prompt: o.agent ? agent.agentPreamble(o.agent, tools) + prompt : prompt, attach });
+  let r = await askD({ ...base, prompt: o.agent ? agent.agentPreamble(ws, tools) + prompt : prompt, attach });
   // Remember how far the conversation was shared into this Gemini chat (saved chats only: a
   // temporary chat can't be reopened, so the next share there must be a full one).
   if (brief && brief.turns && session && r.ok && r.url) shares.set(session, { transcript, lastTs: brief.lastTs, url: r.url });
@@ -224,7 +237,7 @@ async function ask(o) {
       round++;
       err(`round ${round}: ` + cmds.join(' ; '));
       const parts = [];
-      for (const t of cmds) parts.push(`### ${t}\n\`\`\`\n${await agent.runTool(o.agent, t, tools)}\n\`\`\``); // one at a time
+      for (const t of cmds) parts.push(`### ${t}\n\`\`\`\n${await agent.runTool(ws, t, tools)}\n\`\`\``); // one at a time
       let results = parts.join('\n\n');
       if (results.length > agent.MAX_OUT) results = results.slice(0, agent.MAX_OUT) + '\n... (results truncated; request smaller ranges)';
       const last = round === rounds ? '\n\nThis was the last tool round. Give your FINAL answer now.' : '';
@@ -236,8 +249,8 @@ async function ask(o) {
     const text = agent.extractPatch(r.answer);
     if (!text) break;
     const file = o.patchOut || path.join(cfg.TMP, `patch-${Date.now()}.diff`);
-    const chk = agent.checkPatch(o.agent, text, file);
-    patch = { file, applies: chk.ok, strip: chk.strip, error: chk.error || null };
+    const chk = agent.checkPatch(ws, text, file);
+    patch = { file, applies: chk.ok, strip: chk.strip, parts: chk.parts || null, error: chk.error || null };
     if (chk.ok !== false || fixes >= 2) break;
     fixes++;
     if (explanation === null) explanation = r.answer;
@@ -258,7 +271,9 @@ function printResult(r, o) {
   else {
     for (const w of r.warnings || []) err('warning: ' + w);
     err(`model: Gemini ${r.model} | ${Math.round(r.ms / 1000)}s` + (r.session && !r.session.startsWith('_') ? ` | session: ${r.session}` : ''));
-    if (patch) err(patch.applies
+    if (patch && patch.applies && patch.parts) { // several folders: one patch file per folder
+      for (const p of patch.parts) err(`patch for ${p.root}: ${p.file} (applies cleanly; to apply, in ${p.dir}: git apply --recount --ignore-whitespace -p${p.strip} "${p.file}")`);
+    } else if (patch) err(patch.applies
       ? `patch: ${patch.file} (applies cleanly; to apply: git apply --recount --ignore-whitespace -p${patch.strip} "${patch.file}")`
       : `patch: ${patch.file} (${patch.applies === null ? 'not checked' : 'does NOT apply'}: ${patch.error.split('\n')[0]})`);
     const media = r.media || [];

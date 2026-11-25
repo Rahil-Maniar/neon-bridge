@@ -121,4 +121,4 @@ function shareLog(file) {
   };
 }
 
-module.exports = { findTranscript, buildBrief, redact, chatPreamble, chatUpdatePreamble, shareLog };
+module.exports = { findTranscript, buildBrief, redact, chatPreamble, chatUpdatePreamble, shareLog, SECRETS };
