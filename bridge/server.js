@@ -62,15 +62,46 @@ const SEL = {
   temp: 'button[aria-label="Turn on temporary chat"]',
   file: 'input.hidden-file-input',
   chip: 'uploader-file-preview',
+  uploadMenu: 'button[aria-label="Upload & tools"], button[aria-label*="upload" i][aria-label*="tool" i], button[aria-label^="Open upload file menu"]',
+  uploadItem: '[data-test-id="local-images-files-uploader-button"], [role=menuitem]:has-text("Upload files"), button:has-text("Upload files")',
   abPick: 'This response is more helpful',
 };
+
+// ---------- request results (kept 48h, so an interrupted client can collect its answer) ----------
+const jobs = (() => {
+  const dir = cfg.RESULTS, running = new Set();
+  const file = id => path.join(dir, id.replace(/[^\w.-]/g, '_') + '.json');
+  const write = (id, data) => { try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file(id), JSON.stringify(data)); } catch (e) { log('result write failed', e.message); } };
+  const read = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+  try { for (const f of fs.readdirSync(dir)) { const p = path.join(dir, f); if (Date.now() - fs.statSync(p).mtimeMs > 48 * 3600e3) fs.rmSync(p, { force: true }); } } catch {}
+  return {
+    start(id, body) { running.add(id); write(id, { id, status: 'running', startedAt: Date.now(), session: body.session || null, prompt: String(body.prompt || '').slice(0, 200) }); },
+    finish(id, result) { running.delete(id); const j = read(file(id)) || { id }; write(id, { ...j, status: 'done', finishedAt: Date.now(), result }); },
+    // Look up by exact id or id prefix (an agent run's rounds are "<id>.<n>"); the newest match wins.
+    get(id) {
+      if (!id) return { status: 'unknown', error: 'no id given' };
+      let hits = [];
+      try { hits = fs.readdirSync(dir).filter(f => f === `${id}.json` || f.startsWith(`${id}.`)).map(f => path.join(dir, f)); } catch {}
+      if (!hits.length) return { id, status: 'unknown' };
+      const j = read(hits.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0]) || { id, status: 'unknown' };
+      if (j.status === 'running' && !running.has(j.id)) j.status = 'lost'; // the daemon restarted mid-request
+      return j;
+    },
+    list() {
+      let out = [];
+      try { out = fs.readdirSync(dir).map(f => read(path.join(dir, f))).filter(Boolean); } catch {}
+      return out.map(j => ({ id: j.id, status: j.status === 'running' && !running.has(j.id) ? 'lost' : j.status, ok: j.result ? j.result.ok : null, session: j.session, startedAt: j.startedAt, prompt: (j.prompt || '').slice(0, 80) }))
+        .sort((a, b) => b.startedAt - a.startedAt).slice(0, 30);
+    },
+  };
+})();
 
 class BridgeError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 async function ensureModel(page, model) {
   const mode = page.locator(SEL.mode);
-  try { await mode.first().waitFor({ timeout: 15000 }); } catch { throw new BridgeError('LAYOUT', 'Model picker not found'); }
+  try { await mode.first().waitFor({ timeout: 30000 }); } catch { throw new BridgeError('LAYOUT', 'Model picker not found'); }
   const label = (await mode.getAttribute('aria-label')) || '';
   if (new RegExp('currently\\s+' + esc(model) + '\\b', 'i').test(label)) return;
   await mode.click(); await sleep(800);
@@ -84,18 +115,23 @@ async function ensureModel(page, model) {
   }
 }
 
-async function openSession(name, temp, resumeUrl) {
+async function newGeminiPage(url) {
   const page = await ctx.newPage();
   await page.setViewportSize({ width: 1600, height: 1000 });
   const cdp = await ctx.newCDPSession(page);
   await cdp.send('Emulation.setUserAgentOverride', { userAgent });
-  await page.goto(resumeUrl || cfg.GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto(url || cfg.GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
   try { await page.locator(SEL.input).first().waitFor({ timeout: 30000 }); }
   catch {
-    const url = page.url(); await page.close();
-    if (/accounts\.google\.com|signin|ServiceLogin/i.test(url)) throw new BridgeError('SIGNED_OUT', 'Not signed in; run: node neon.js setup');
-    throw new BridgeError('LAYOUT', 'Gemini input box not found at ' + url);
+    const at = page.url(); await page.close();
+    if (/accounts\.google\.com|signin|ServiceLogin/i.test(at)) throw new BridgeError('SIGNED_OUT', 'Not signed in; run: node neon.js setup');
+    throw new BridgeError('LAYOUT', 'Gemini input box not found at ' + at);
   }
+  return page;
+}
+
+async function openSession(name, temp, resumeUrl) {
+  const page = await newGeminiPage(resumeUrl);
   const warnings = [];
   if (temp && !resumeUrl) {
     try { await page.locator(SEL.temp).first().waitFor({ timeout: 8000 }); await page.locator(SEL.temp).first().click(); await sleep(800); }
@@ -160,6 +196,27 @@ function domToMarkdown() {
     return kids();
   };
   return block(root).replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Attach files. Gemini only creates its hidden file input once the "Upload & tools" menu is opened,
+// so use the menu's "Upload files" item and its file chooser; fall back to an existing input.
+// The inputs exist only while that menu is open, so never rely on one being there beforehand.
+async function uploadFiles(page, files) {
+  const menu = page.locator(SEL.uploadMenu).first();
+  if (!(await menu.count())) {
+    if (await page.locator(SEL.file).count()) return page.locator(SEL.file).first().setInputFiles(files, { timeout: 5000 });
+    throw new BridgeError('LAYOUT', 'Upload button not found');
+  }
+  await menu.click(); await sleep(800);
+  const item = page.locator(SEL.uploadItem).first();
+  if (await item.count()) {
+    const [chooser] = await Promise.all([page.waitForEvent('filechooser', { timeout: 10000 }).catch(() => null), item.click()]);
+    if (chooser) return chooser.setFiles(files);
+  }
+  try {
+    if (await page.locator(SEL.file).count()) return await page.locator(SEL.file).first().setInputFiles(files, { timeout: 5000 });
+  } finally { await page.keyboard.press('Escape').catch(() => {}); }
+  throw new BridgeError('UPLOAD', 'Could not open Gemini\'s file upload');
 }
 
 // ---------- generated images and videos ----------
@@ -263,21 +320,22 @@ async function getSession(name, temp) {
   return { s, warnings };
 }
 
-async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEFAULT_MODEL, timeoutSec = 600, mediaDir }) {
+async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEFAULT_MODEL, timeoutSec = 600, mediaDir, stallSec = cfg.STALL_SEC }) {
   const t0 = Date.now();
   const name = session || ('_once_' + t0 + Math.random().toString(36).slice(2, 6));
   const { s, warnings } = await getSession(name, temp);
   if (s.busy) throw new BridgeError('BUSY', `Session "${name}" is already handling a request`);
   s.busy = true;
-  const page = s.page;
+  let page = s.page;
   try {
+    const chatUrl = /\/app\/[0-9a-f]+/.test(page.url()) ? page.url() : null; // null = a new chat
     let before, abBefore;
-    await withUi(async () => {
+    const send = () => withUi(async () => {
       await page.bringToFront(); // background tabs don't render, which stalls input
       await ensureModel(page, model);
       if (attach.length) {
         const chips0 = await page.locator(SEL.chip).count();
-        await page.locator(SEL.file).first().setInputFiles(attach);
+        await uploadFiles(page, attach);
         const until = Date.now() + 120000;
         while ((await page.locator(SEL.chip).count()) < chips0 + attach.length) {
           if (Date.now() > until) throw new BridgeError('UPLOAD', 'Attachments did not appear'); await sleep(500);
@@ -297,10 +355,25 @@ async function ask({ session, prompt, attach = [], temp = false, model = cfg.DEF
         if (Date.now() > until) throw new BridgeError('SEND', 'Prompt could not be sent');
       }
     });
+    await send();
 
     const deadline = Date.now() + timeoutSec * 1000;
+    let sentAt = Date.now(), resent = false;
     while ((await page.locator(SEL.resp).count()) <= before) {
-      if (Date.now() > deadline) throw new BridgeError('TIMEOUT', 'No reply started');
+      if (Date.now() > deadline) throw new BridgeError('TIMEOUT', resent ? 'No reply started, even after resending once' : 'No reply started');
+      // Gemini sometimes accepts a prompt and never answers it. Replies normally start within seconds,
+      // so after stallSec resend once on a fresh page (the same chat, or a new chat if it was new).
+      if (!resent && stallSec > 0 && Date.now() - sentAt > stallSec * 1000) {
+        resent = true;
+        log('stall: no reply after', stallSec, 's; resending in', chatUrl ? 'the same chat' : 'a new chat');
+        warnings.push(`Gemini did not start replying within ${stallSec}s; resent the prompt once` + (chatUrl ? ' (it may appear twice in that chat)' : ' in a new chat'));
+        const old = page;
+        page = s.page = await withUi(() => newGeminiPage(chatUrl));
+        await old.close().catch(() => {});
+        await send();
+        sentAt = Date.now();
+        continue;
+      }
       const ab = page.getByText(SEL.abPick);
       if ((await ab.count()) > abBefore) { // A/B "Choice A / Choice B": let both drafts finish, then pick A
         let prev = -1, stable = Date.now();
@@ -377,11 +450,32 @@ const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'applic
         const saved = Object.keys(stored).filter(k => !sessions.has(k)).map(k => ({ name: k, url: stored[k].url, turns: stored[k].turns, live: false }));
         return send(res, 200, [...live, ...saved]);
       }
+      if (req.method === 'GET' && req.url.startsWith('/result')) {
+        const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
+        return send(res, 200, jobs.get(id));
+      }
+      if (req.method === 'GET' && req.url === '/results') return send(res, 200, jobs.list());
       const body = req.method === 'POST' ? await readBody(req) : {};
-      if (req.url === '/ask') { const r = await ask(body); lastActivity = Date.now(); return send(res, 200, r); }
+      if (req.url === '/ask') {
+        // The answer is also kept on disk under requestId, so it can be collected later
+        // even if the client that asked (e.g. a background shell) is killed meanwhile.
+        const id = body.requestId;
+        if (id) jobs.start(id, body);
+        let r;
+        try { r = await ask(body); }
+        catch (e) { log('error', e.code || '', e.message); r = { ok: false, code: e.code || 'ERROR', error: e.message }; }
+        if (id) jobs.finish(id, r);
+        lastActivity = Date.now();
+        return send(res, r.ok ? 200 : 500, r);
+      }
       if (req.url === '/check') return send(res, 200, await check(body));
       if (req.url === '/end') { await endSession(body.session); return send(res, 200, { ok: true }); }
-      if (req.url === '/shutdown') { send(res, 200, { ok: true }); return setTimeout(shutdown, 100); }
+      if (req.url === '/shutdown') {
+        // Other Claude sessions may share this daemon; don't kill their requests unless forced.
+        const running = [...sessions.values()].filter(s => s.busy).length;
+        if (running && !body.force) return send(res, 409, { ok: false, code: 'BUSY', running, error: `${running} request(s) still running` });
+        send(res, 200, { ok: true }); return setTimeout(shutdown, 100);
+      }
       send(res, 404, { ok: false, error: 'not found' });
     } catch (e) {
       log('error', e.code || '', e.message);

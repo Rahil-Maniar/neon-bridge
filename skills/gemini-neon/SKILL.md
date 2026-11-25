@@ -53,8 +53,13 @@ Output and behavior:
 - Images and videos Gemini generates are saved automatically (full size for images) and listed after the answer under **Generated files**, and on stderr. With `--json` they are in `media: [{type, file, bytes}]`. Ask for them in plain words ("Generate an image of ..."). Image saving is tested; video saving is implemented but not yet verified against a real Gemini video. Image replies take about 30–70s; videos take minutes and the user's plan allows only a few per day, so generate videos only when the user asks. Show or hand over the saved files; do not describe them as if you had seen them unless you open them.
 - Exit codes: 0 ok, 2 not set up or signed out, 3 model not available on this plan, 4 timed out or partial answer, 1 other.
 - Prompts over 20k characters are sent automatically as an attached file.
-- Use a tool timeout of at least 300000 ms, or 600000 for agent mode. Long agent tasks can run in the background.
 - Different sessions can run in parallel. A single session handles one request at a time.
+
+## Running a request: wait for the answer
+- **Run Neon in the foreground and wait for it in the same turn.** Use the shell tool's maximum timeout (600000 ms) and `--timeout 540` so the bridge gives up before the tool does. Don't run it in the background and don't end your turn with "I'll wait for Neon": a background command is killed if the session restarts between turns, and nothing tells you it's done.
+- You may do other work in parallel only by running Neon in the background **and** continuing to work in the same turn, then collecting the answer before you end the turn. Never end a turn with a Neon request still pending.
+- Every request prints `request <ID>` on stderr. If a run was interrupted (killed, timed out on your side, or the session restarted), collect it with `neon.js result <ID>` instead of asking again; it waits while Neon is still working. `neon.js results` lists recent requests and their status. Only re-ask when `result` says the request is unknown or was interrupted.
+- If Gemini accepts a prompt but hasn't started replying after 90s, the bridge resends it once by itself (`--stall SEC` changes this, 0 turns it off) and adds a warning. Don't add your own retries on top: if a request still fails, report the error to the user before trying again.
 
 ## Agent mode
 `--agent ROOT` gives the model read-only tools inside ROOT: `LIST`, `READ` (with line ranges), `GREP` (regex, optional `context=N`), `FIND`, `DEFS` (where a function/class/variable is defined) and `GIT` (read-only: diff, log, show, blame, status, ls-files, grep, shortlog, rev-parse, branch/tag listing). It decides what to read, the bridge runs it and sends back the results, and this loops until it gives a final answer. Paths outside ROOT are refused, as are secret-like files (`.env`, keys, credentials, `.ssh`, `.git` internals), including their sections in git diffs. Dependency and build folders are skipped. Use it for independent code reviews, bug hunts or architecture questions.
@@ -89,5 +94,5 @@ Everything sent goes to Google under the user's account, even in temporary chats
 ## Troubleshooting
 - **Exit 2:** the user runs `setup` again; it opens the browser to sign in. `doctor` shows what's wrong.
 - **Exit 3:** the model isn't available on this account's plan, or Gemini's UI changed. Run `doctor`.
-- **Layout errors or hangs:** run `stop --force` and retry. The log is in `~/.neon-bridge/daemon.log`, or `$NEON_BRIDGE_HOME`.
+- **Layout errors or hangs:** the bridge already resends a stuck prompt once. The daemon is shared by every Claude session on this machine, so before restarting it run `neon.js results`: if another request is running, don't restart. Plain `stop` refuses while requests are running; use `stop --force` only when nothing else needs Neon, then retry. The log is in `~/.neon-bridge/daemon.log`, or `$NEON_BRIDGE_HOME`.
 - Gemini sometimes shows an A/B "Choice A / Choice B" comparison. The bridge picks A automatically.

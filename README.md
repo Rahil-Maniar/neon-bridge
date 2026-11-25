@@ -82,7 +82,8 @@ node bridge/neon.js ask --out ./art "Generate an image of a lighthouse in a stor
 node bridge/neon.js ask --chat-preview "x"     # see what --with-chat would share from the current Claude Code chat
 node bridge/neon.js ask --agent ./my-repo "Find the most likely cause of the race condition in the job queue"
 node bridge/neon.js ask --agent ./my-repo --allow-run "npm test" --patch "Fix the failing date parser test"
-node bridge/neon.js doctor | sessions | end NAME | status | stop [--force]
+node bridge/neon.js result ID     # collect an earlier answer (e.g. after an interrupted run); waits if still running
+node bridge/neon.js doctor | results | sessions | end NAME | status | stop [--force]
 ```
 Exit codes: `0` ok, `2` not set up or signed out, `3` model not available, `4` timed out or partial answer, `1` other.
 
@@ -112,7 +113,7 @@ Environment variables, or `config.json` in the bridge home:
 - **"Not set up" or "signed out":** run `setup` again.
 - **Model not available:** check that your plan includes it (open gemini.google.com and look at the model picker), then run `doctor`.
 - **It breaks after a Gemini redesign:** the page selectors are in the `SEL` object in `bridge/server.js`. `node bridge/server.js --show` runs the daemon with a visible window, and `bridge/dev/inspect.js` dumps the page's controls. PRs welcome.
-- **Hangs:** run `stop --force` and try again. Logs are in `~/.neon-bridge/daemon.log`.
+- **Hangs:** the bridge resends a prompt once if Gemini has not started replying after 90s (`--stall SEC`, `0` = off). The daemon is shared by everything on your machine that uses neon-bridge, so `stop` refuses while requests are running; `stop --force` stops it anyway. An interrupted request can still be collected with `result ID`. Logs are in `~/.neon-bridge/daemon.log`.
 
 ## License
 

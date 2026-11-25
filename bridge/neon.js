@@ -25,7 +25,10 @@
 //     --max-rounds N       agent-mode tool rounds (default 12)
 //     --file PATH          read the prompt from a file
 //     --timeout SEC        per-turn timeout (default 600)
+//     --stall SEC          resend once if Gemini hasn't started replying after SEC (default 90; 0 = off)
 //     --json               print the raw JSON result
+//   node neon.js result ID [--timeout SEC]   collect (or keep waiting for) an earlier request's answer
+//   node neon.js results                     recent requests and their status
 //   node neon.js sessions | end NAME | status | stop [--force]
 //
 // Exit codes: 0 ok, 2 signed out, 3 model unavailable, 4 timeout/partial answer, 1 other error.
@@ -132,6 +135,7 @@ function parseArgs(argv) {
     else if (a === '--patch') o.patch = true;
     else if (a === '--patch-out') { o.patch = true; o.patchOut = path.resolve(argv[++i]); }
     else if (a === '--out') o.out = path.resolve(argv[++i]);
+    else if (a === '--stall') o.stall = +argv[++i];
     else if (a === '--file') o.file = argv[++i];
     else if (a === '--timeout') o.timeout = +argv[++i];
     else if (a === '--json') o.json = true;
@@ -171,11 +175,17 @@ async function ask(o) {
   }
 
   const session = o.session || (o.agent ? `_agent_${Date.now()}` : undefined);
-  const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL, mediaDir: o.out };
+  const base = { session, temp: !!o.temp, timeoutSec: o.timeout || 600, model: o.model || cfg.DEFAULT_MODEL, mediaDir: o.out, stallSec: o.stall };
+  // Every request gets an id; the daemon keeps its answer, so it can be collected with
+  // "result ID" if this process is killed (e.g. a background shell that ends with its session).
+  const runId = new Date().toISOString().replace(/\D/g, '').slice(2, 14) + '-' + Math.random().toString(36).slice(2, 6);
+  let calls = 0;
+  const askD = body => call('POST', '/ask', { ...body, requestId: calls++ ? `${runId}.${calls}` : runId });
+  err(`request ${runId} (if this gets interrupted, collect the answer with: neon.js result ${runId})`);
   const send = (msg, label) => msg.length > 20000
-    ? call('POST', '/ask', { ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
-    : call('POST', '/ask', { ...base, prompt: msg });
-  let r = await call('POST', '/ask', { ...base, prompt: o.agent ? agent.agentPreamble(o.agent, tools) + prompt : prompt, attach });
+    ? askD({ ...base, prompt: `The ${label} are in the attached file. Read it fully, then continue (more neon-tools commands, or your FINAL answer).`, attach: [asFile(msg, 'tools')] })
+    : askD({ ...base, prompt: msg });
+  let r = await askD({ ...base, prompt: o.agent ? agent.agentPreamble(o.agent, tools) + prompt : prompt, attach });
   const rounds = o.maxRounds || 12;
   let round = 0, fixes = 0, explanation = null, patch = null;
   while (o.agent && r.ok) {
@@ -209,11 +219,16 @@ async function ask(o) {
   if (explanation !== null && r.ok) r.answer = explanation + '\n\n---\n**Corrected patch** (the patch above did not apply; this one replaces it):\n\n' + r.answer;
   if (patch) r.patch = patch;
 
+  return printResult(r, o);
+}
+
+function printResult(r, o) {
+  const patch = r.patch;
   if (o.json) console.log(JSON.stringify(r, null, 1));
   else if (!r.ok) err(`${r.code}: ${r.error}`);
   else {
     for (const w of r.warnings || []) err('warning: ' + w);
-    err(`model: Gemini ${r.model} | ${Math.round(r.ms / 1000)}s` + (o.session ? ` | session: ${o.session}` : ''));
+    err(`model: Gemini ${r.model} | ${Math.round(r.ms / 1000)}s` + (r.session && !r.session.startsWith('_') ? ` | session: ${r.session}` : ''));
     if (patch) err(patch.applies
       ? `patch: ${patch.file} (applies cleanly; to apply: git apply --recount --ignore-whitespace -p${patch.strip} "${patch.file}")`
       : `patch: ${patch.file} (${patch.applies === null ? 'not checked' : 'does NOT apply'}: ${patch.error.split('\n')[0]})`);
@@ -224,6 +239,31 @@ async function ask(o) {
   }
   if (!r.ok) return EXIT[r.code] || 1;
   return r.partial ? 4 : 0;
+}
+
+// Collect the answer to an earlier request, waiting while it is still running.
+async function result(o) {
+  const id = o.rest[0];
+  if (!id) { err('usage: neon.js result ID [--timeout SEC]'); return 1; }
+  if (!(await daemonUp())) {
+    // Finished results are files, so they can be read without the daemon.
+    const f = path.join(cfg.RESULTS, id + '.json');
+    const j = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
+    if (j && j.status === 'done') return printResult(j.result, o);
+    err(j ? 'that request was interrupted before Neon answered (the bridge stopped); ask again' : `no request "${id}" found`);
+    return 1;
+  }
+  const until = Date.now() + (o.timeout || 600) * 1000;
+  let shown = false;
+  while (true) {
+    const j = await call('GET', '/result?id=' + encodeURIComponent(id));
+    if (j.status === 'done') return printResult(j.result, o);
+    if (j.status === 'lost') { err('that request was interrupted before Neon answered (the bridge restarted); ask again'); return 1; }
+    if (j.status !== 'running') { err(`no request "${id}" found`); return 1; }
+    if (Date.now() > until) { err(`still running after ${o.timeout || 600}s; run "result ${id}" again later`); return 4; }
+    if (!shown) { err(`waiting for Neon (started ${Math.round((Date.now() - j.startedAt) / 1000)}s ago)...`); shown = true; }
+    await sleep(3000);
+  }
 }
 
 async function main() {
@@ -237,9 +277,21 @@ async function main() {
     case 'status': console.log((await daemonUp()) ? 'running' : 'not running'); return 0;
     case 'stop': {
       const up = await daemonUp();
-      if (up) await call('POST', '/shutdown').catch(() => {});
+      if (up) {
+        const r = await call('POST', '/shutdown', { force: !!o.force }).catch(() => ({ ok: true }));
+        if (!r.ok && r.code === 'BUSY') {
+          err(`not stopped: ${r.running} request(s) still running (maybe from another Claude session). Check "results"; use "stop --force" only if nothing else needs Neon.`);
+          return 1;
+        }
+      }
       const forced = o.force ? await forceCloseBrowser() : false;
       err(up ? 'daemon stopped' : 'daemon not running'); if (forced) err('closed orphaned browser'); return 0;
+    }
+    case 'result': return result(o);
+    case 'results': {
+      if (!(await daemonUp())) { err('daemon not running'); return 0; }
+      for (const j of await call('GET', '/results')) console.log(`${j.id}  ${j.status === 'done' ? (j.ok ? 'done' : 'failed') : j.status}  ${new Date(j.startedAt).toLocaleString()}  ${j.prompt.replace(/\s+/g, ' ')}`);
+      return 0;
     }
     case 'sessions': await ensureDaemon(); console.log(JSON.stringify(await call('GET', '/sessions'), null, 1)); return 0;
     case 'end': await ensureDaemon(); await call('POST', '/end', { session: o.rest[0] }); err('ended', o.rest[0]); return 0;
