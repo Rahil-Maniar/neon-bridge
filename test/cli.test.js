@@ -13,7 +13,8 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'neon-cli-'));
 let home, port, server;
 
 // The fake daemon: records every request and answers with the handlers a test sets.
-const fake = { calls: [], ask: null, sessions: [], result: null, results: [], shutdown: null };
+const OWN = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
+const fake = { calls: [], ask: null, sessions: [], result: null, results: [], shutdown: null, health: null };
 function reset() {
   fake.calls = [];
   fake.ask = body => ({ ok: true, answer: 'pong', model: 'Neon', ms: 1000, session: body.session || null, url: body.session ? 'https://gemini.google.com/app/abc123' : null, warnings: [] });
@@ -21,6 +22,7 @@ function reset() {
   fake.result = () => ({ status: 'unknown' });
   fake.results = [];
   fake.shutdown = () => ({ ok: true });
+  fake.health = () => ({ ok: true, version: OWN });
 }
 
 before(async () => {
@@ -31,7 +33,7 @@ before(async () => {
       const body = data ? JSON.parse(data) : {};
       fake.calls.push({ method: req.method, url: req.url, body });
       const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
-      if (req.url === '/health') return send(200, { ok: true });
+      if (req.url === '/health') { const h = fake.health(); return h ? send(200, h) : res.destroy(); } // null = daemon gone
       if (req.url === '/sessions') return send(200, fake.sessions);
       if (req.url === '/results') return send(200, fake.results);
       if (req.url.startsWith('/result?')) return send(200, fake.result(new URL(req.url, 'http://x').searchParams.get('id')));
@@ -207,4 +209,50 @@ test('options reach the daemon', async () => {
 test('the prompt can come from stdin', async () => {
   await run(['ask'], { stdin: 'from stdin' });
   assert.strictEqual(asks()[0].prompt, 'from stdin');
+});
+
+test('an older idle daemon is replaced; a busy or unknown one is left alone with a warning', async () => {
+  // Idle and reports busy flags: replaced. (No profile, so the CLI then stops at "not set up" instead of starting a real daemon.)
+  fs.rmSync(path.join(home, 'profile'), { recursive: true });
+  let down = false;
+  fake.health = () => ({ ok: true, version: '0.1.0' });
+  fake.sessions = [{ name: 'x', busy: false }];
+  fake.shutdown = () => { down = true; return { ok: true }; };
+  const origHealth = fake.health;
+  fake.health = () => (down ? null : origHealth());
+  let r = await run(['ask', 'q']);
+  assert.match(r.stderr, /replacing the idle bridge daemon \(0\.1\.0\)/);
+  assert.ok(fake.calls.some(c => c.url === '/shutdown' && c.body.force === false));
+
+  // Busy: left running, warned, request still goes through.
+  fs.mkdirSync(path.join(home, 'profile'));
+  reset(); fake.health = () => ({ ok: true, version: '0.1.0' }); fake.sessions = [{ name: 'x', busy: true }];
+  r = await run(['ask', 'q']);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stderr, /older than this .* and busy; it will be replaced once idle/);
+  assert.ok(!fake.calls.some(c => c.url === '/shutdown'));
+
+  // Too old to report a version or anything running: left alone.
+  reset(); fake.health = () => ({ ok: true }); fake.sessions = [{ name: 'x' }]; fake.results = null;
+  r = await run(['ask', 'q']);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stderr, /the running bridge daemon is an old version/);
+  assert.ok(!fake.calls.some(c => c.url === '/shutdown'));
+});
+
+test('an old installed copy hands the request to the newest one', async () => {
+  // Lay out a plugin cache: <base>/0.5.0 is a real copy of the bridge, <base>/9.9.9 a stub that echoes its args.
+  const base = path.join(home, 'cache', 'neon-bridge', 'neon-bridge');
+  const old = path.join(base, '0.5.0');
+  fs.cpSync(path.join(__dirname, '..', 'bridge'), path.join(old, 'bridge'), { recursive: true });
+  fs.writeFileSync(path.join(old, 'package.json'), JSON.stringify({ version: '0.5.0' }));
+  fs.mkdirSync(path.join(base, '9.9.9', 'bridge'), { recursive: true });
+  fs.writeFileSync(path.join(base, '9.9.9', 'bridge', 'neon.js'), "console.log('NEWER ' + process.argv.slice(2).join(' ') + ' ' + process.env.NEON_NO_HANDOFF); process.exit(7);");
+  fs.mkdirSync(path.join(base, 'not-a-version', 'bridge'), { recursive: true });
+  const env = { ...process.env, NEON_BRIDGE_HOME: home, NEON_API_PORT: String(port) };
+  const r = await new Promise(res => execFile(process.execPath, [path.join(old, 'bridge', 'neon.js'), 'ask', 'hello'], { env }, (e, stdout, stderr) => res({ code: e ? e.code : 0, stdout, stderr })));
+  assert.strictEqual(r.code, 7, 'exit code comes from the newer copy');
+  assert.strictEqual(r.stdout.trim(), 'NEWER ask hello 1');
+  assert.match(r.stderr, /this copy is 0\.5\.0; using the newer installed 9\.9\.9/);
+  assert.strictEqual(asks().length, 0, 'the old copy sent nothing itself');
 });

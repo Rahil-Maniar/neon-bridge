@@ -13,6 +13,7 @@ const { spawn } = require('child_process');
 const cfg = require('./config');
 const { resolvePlaywright } = require('./deps');
 const { createJobs, shutdownCheck } = require('./jobs');
+const version = require('./version');
 
 const pw = resolvePlaywright();
 if (!pw) { console.error('playwright-core missing; run: node neon.js setup'); process.exit(1); }
@@ -418,7 +419,7 @@ const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'applic
   const server = http.createServer(async (req, res) => {
     lastActivity = Date.now();
     try {
-      if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true, sessions: [...sessions.keys()].filter(k => !k.startsWith('_')).length });
+      if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true, version: version.own, sessions: [...sessions.keys()].filter(k => !k.startsWith('_')).length });
       if (req.method === 'GET' && req.url === '/sessions') {
         const stored = loadStore();
         const live = [...sessions].filter(([k]) => !k.startsWith('_')).map(([k, v]) => ({ name: k, url: v.temp ? null : v.url, temp: v.temp, turns: v.turns, live: true, busy: !!v.busy }));
