@@ -114,6 +114,7 @@ Environment variables, or `config.json` in the bridge home:
 - **Model not available:** check that your plan includes it (open gemini.google.com and look at the model picker), then run `doctor`.
 - **It breaks after a Gemini redesign:** the page selectors are in the `SEL` object in `bridge/server.js`. `node bridge/server.js --show` runs the daemon with a visible window, and `bridge/dev/inspect.js` dumps the page's controls. PRs welcome.
 - **Hangs:** the bridge resends a prompt once if Gemini has not started replying after 90s (`--stall SEC`, `0` = off). The daemon is shared by everything on your machine that uses neon-bridge, so `stop` refuses while requests are running; `stop --force` stops it anyway. An interrupted request can still be collected with `result ID`. Logs are in `~/.neon-bridge/daemon.log`.
+- **Old versions:** a chat that was started with an older plugin version keeps calling that version's folder. From 0.6.0 on, an older copy hands each request to the newest installed version, and a daemon started by an older version is replaced as soon as it is idle.
 
 ## License
 

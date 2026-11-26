@@ -39,10 +39,11 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const cfg = require('./config');
 const { ensurePlaywright, resolvePlaywright } = require('./deps');
 const chat = require('./chat');
+const version = require('./version');
 const agent = require('./agent');
 
 const err = (...m) => process.stderr.write('[neon] ' + m.join(' ') + '\n');
@@ -64,7 +65,30 @@ function call(method, p, body) {
 
 async function daemonUp() { try { await call('GET', '/health'); return true; } catch { return false; } }
 
+// A daemon started by an older copy of the bridge lacks newer fixes. Replace it when nothing is running
+// on it; if it's busy (or too old to tell), leave it and say so.
+async function replaceOldDaemon() {
+  const h = await call('GET', '/health').catch(() => null);
+  if (!h || version.compare(h.version, version.own) >= 0) return;
+  const label = h.version || 'an old version';
+  let busy = null;
+  const live = await call('GET', '/sessions').catch(() => null);
+  if (Array.isArray(live) && live.some(x => 'busy' in x)) busy = live.some(x => x.busy);
+  if (busy === null) {
+    const res = await call('GET', '/results').catch(() => null);
+    if (Array.isArray(res)) busy = res.some(j => j.status === 'running');
+  }
+  if (busy !== false) {
+    err(`warning: the running bridge daemon is ${label}, older than this ${version.own}` + (busy ? ' and busy' : '') + '; it will be replaced once idle ("stop" when nothing else needs Neon, then retry, replaces it now)');
+    return;
+  }
+  err(`replacing the idle bridge daemon (${label}) with ${version.own}`);
+  await call('POST', '/shutdown', { force: false }).catch(() => {});
+  for (let i = 0; i < 20 && (await daemonUp()); i++) await sleep(500);
+}
+
 async function ensureDaemon() {
+  if (await daemonUp()) await replaceOldDaemon();
   if (await daemonUp()) return;
   if (!fs.existsSync(cfg.PROFILE)) throw Object.assign(new Error(`Not set up yet; run: node "${__filename}" setup`), { exit: 2 });
   ensurePlaywright(err);
@@ -296,6 +320,13 @@ async function result(o) {
 }
 
 async function main() {
+  // An old chat may still call an old copy of the bridge: hand over to the newest installed one.
+  const newer = process.env.NEON_NO_HANDOFF ? null : version.newerCopy();
+  if (newer) {
+    err(`this copy is ${version.own}; using the newer installed ${newer.version}`);
+    const r = spawnSync(process.execPath, [newer.file, ...process.argv.slice(2)], { stdio: 'inherit', env: { ...process.env, NEON_NO_HANDOFF: '1' } });
+    return r.status ?? 1;
+  }
   const [cmd, ...argv] = process.argv.slice(2);
   const o = parseArgs(argv);
   const model = o.model || cfg.DEFAULT_MODEL;
