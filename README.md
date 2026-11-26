@@ -27,7 +27,7 @@ Claude Code ──skill──▶ neon.js (CLI) ──HTTP, localhost only──�
 | **Attachments** | `-a file` uploads code, PDFs, images, videos and so on. Prompts over 20k characters are sent as a file automatically |
 | **Generated images and videos** | When Gemini makes an image or video, it is saved at full size (`--out DIR`, or a new folder in the bridge home) and the file paths are listed after the answer |
 | **Share the conversation** | `--with-chat` attaches the current Claude Code chat: what you and Claude said, with tool output left out, secrets redacted and the oldest turns dropped past a size limit. The skill asks you before every request whether to include it. `--chat-preview` shows what would be sent. Sharing again into the same Gemini chat sends only the new turns |
-| **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …) in that folder. Secret-like files (`.env`, keys, credentials, `.ssh`, …) are always blocked |
+| **Agent mode** | `--agent DIR`: Neon can `LIST` / `READ` / `GREP` / `FIND` / `DEFS` (symbol definitions) and use read-only `GIT` (diff, log, show, blame, …). Repeat `--agent name=DIR` to give it several folders at once (e.g. a backend and a frontend). Files git ignores are hidden, data files (spreadsheets, CSV, databases, dumps, uploads) are hidden, secret files are blocked, and values that look like credentials are redacted |
 | **Run checks** | `--allow-run "npm test"`: Neon may also run that command (plus extra args) to check its ideas. Off by default; only the prefixes you allow |
 | **Patches** | `--patch`: Neon proposes changes as a unified diff. It is checked with `git apply --check`, saved to a file, never applied, and sent back to Neon if it doesn't apply |
 | **History** | Chats are saved to your Gemini history. Use `--temp` for a temporary chat (Neon may not reply in temporary chats) |
@@ -81,6 +81,7 @@ node bridge/neon.js ask -a report.pdf "Summarize the risks in this report"
 node bridge/neon.js ask --out ./art "Generate an image of a lighthouse in a storm"
 node bridge/neon.js ask --chat-preview "x"     # see what --with-chat would share from the current Claude Code chat
 node bridge/neon.js ask --agent ./my-repo "Find the most likely cause of the race condition in the job queue"
+node bridge/neon.js ask --agent api=../backend --agent web=../frontend "Does the frontend handle every error the API returns?"
 node bridge/neon.js ask --agent ./my-repo --allow-run "npm test" --patch "Fix the failing date parser test"
 node bridge/neon.js result ID     # collect an earlier answer (e.g. after an interrupted run); waits if still running
 node bridge/neon.js doctor | results | sessions | end NAME | status | stop [--force]

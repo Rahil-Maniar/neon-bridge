@@ -64,7 +64,7 @@ Output and behavior:
 - If Gemini accepts a prompt but hasn't started replying after 90s, the bridge resends it once by itself (`--stall SEC` changes this, 0 turns it off) and adds a warning. Don't add your own retries on top: if a request still fails, report the error to the user before trying again.
 
 ## Agent mode
-`--agent ROOT` gives the model read-only tools inside ROOT: `LIST`, `READ` (with line ranges), `GREP` (regex, optional `context=N`), `FIND`, `DEFS` (where a function/class/variable is defined) and `GIT` (read-only: diff, log, show, blame, status, ls-files, grep, shortlog, rev-parse, branch/tag listing). It decides what to read, the bridge runs it and sends back the results, and this loops until it gives a final answer. Paths outside ROOT are refused, as are secret-like files (`.env`, keys, credentials, `.ssh`, `.git` internals), including their sections in git diffs. Dependency and build folders are skipped. Use it for independent code reviews, bug hunts or architecture questions.
+`--agent DIR` gives the model read-only tools inside DIR: `LIST`, `READ` (with line ranges), `GREP` (regex, optional `context=N`), `FIND`, `DEFS` (where a function/class/variable is defined) and `GIT` (read-only: diff, log, show, blame, status, ls-files, grep, shortlog, rev-parse, branch/tag listing). It decides what to read, the bridge runs it and sends back the results, and this loops until it gives a final answer. Paths outside ROOT are refused, as are secret-like files (`.env`, keys, credentials, `.ssh`, `.git` internals), including their sections in git diffs. Dependency and build folders are skipped. Use it for independent code reviews, bug hunts or architecture questions.
 
 **Running commands (`--allow-run`).** Off by default. Each `--allow-run "npm test"` lets Neon `RUN` that command, optionally with extra arguments (e.g. `npm test -- -t parser`), in ROOT. It gets the exit code and output, so it can check its theory instead of guessing. Commands run with `CI=1`, no stdin, a timeout, and are killed with their whole process tree on timeout. On Windows, arguments containing `& | < > ^ %` or quotes are refused.
 - Allow only specific, non-destructive commands you would run yourself: tests, type checks, linters, builds (`npm test`, `npx tsc --noEmit`, `pytest`, `cargo check`). Never broad prefixes like `npm`, `node`, `python`, `bash` or `git`, and nothing that deploys, publishes, installs, deletes or touches the network.
@@ -76,6 +76,22 @@ Example of a full investigation:
 ```
 node "${CLAUDE_PLUGIN_ROOT}/bridge/neon.js" ask --agent . --allow-run "npm test" --patch "The parser test fails on empty input. Find the cause, confirm it by running the test, and propose a fix."
 ```
+
+**Several folders.** Repeat `--agent` to give Neon more than one folder, e.g. a backend and a frontend repo: `--agent api=../portal-api --agent web=../frontend --agent .`. Each appears under its name (`api/app/...`), so there's no need to clone or copy anything into a scratch folder. With several folders, `GIT` and `RUN` take the folder name first (`GIT web log -n 5`), and `--patch` saves one patch per folder.
+
+**What Neon can see.** Applied automatically, so you don't need to clean up by hand:
+- In a git repo, files git ignores are hidden (build output, local junk, anything in `.gitignore`); new files that aren't committed yet are still visible (`--all-files` shows ignored files too).
+- Data files are hidden: spreadsheets, CSV, JSONL, SQLite and other database files, dumps, backups and `uploads/`, `exports/` folders (`--include-data` shows them; use it only when the user agrees the data can go to Google).
+- Secret files are always blocked (`.env`, keys, credentials, `.ssh`, `.git` internals), and values that look like credentials are replaced with `[REDACTED]` in everything Neon reads, searches or gets from `GIT`/`RUN`: API keys and tokens, passwords in URLs, string literals assigned to password/secret/token names, and in notes, logs and config files any value after such a name.
+- The first line on stderr (`workspace: ...`) says what was included. Redaction is pattern-based, so if the user mentions a specific sensitive file, check it yourself.
+
+## Full-context review recipe
+Use this when the user wants Neon's opinion "with full context" or worries its answer will be weak for lack of context (e.g. "does Neon agree?", "let it look at the code itself").
+1. **Ask once** (AskUserQuestion), naming exactly what Neon will get: which folders, whether to share the conversation (`--with-chat`), and that it all goes to Google under their account. If other repos are involved (a separate backend or frontend), name them and ask before adding them.
+2. **Run it in one command**, foreground, with the tool's maximum timeout: `ask --agent name=DIR [--agent ...] [--with-chat] --max-rounds 20 --timeout 540 --file brief.md`. Put plans or documents Neon should review in the brief or attach them with `-a`. Don't clone repos or copy files into a scratch folder: point `--agent` at them directly.
+3. **If the tool times out,** collect the answer with `result <ID>`; don't start again.
+4. **Check Neon's main claims** against the code (file:line) before you report them, and say which you verified.
+5. **Report** what Neon agreed with, what it added, and where you disagree, labelled as coming from Gemini Neon.
 
 ## How to think about Neon
 Treat Neon as a peer with a different perspective, not a lesser tool. Engage with its reasoning, credit its good ideas, and be open to being the one who's wrong. When you disagree, say why on the merits.

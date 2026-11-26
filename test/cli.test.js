@@ -208,3 +208,21 @@ test('the prompt can come from stdin', async () => {
   await run(['ask'], { stdin: 'from stdin' });
   assert.strictEqual(asks()[0].prompt, 'from stdin');
 });
+
+test('several --agent folders become one workspace', async () => {
+  const a = path.join(home, 'repo-a'), b = path.join(home, 'repo-b');
+  fs.mkdirSync(a); fs.mkdirSync(b);
+  fs.writeFileSync(path.join(a, 'x.txt'), 'x'); fs.writeFileSync(path.join(b, 'y.txt'), 'y');
+  let n = 0;
+  // Round 1 asks for a tool, round 2 answers.
+  fake.ask = body => ({ ok: true, model: 'Neon', ms: 1, session: body.session, answer: n++ ? 'done' : '```neon-tools\nREAD web/y.txt\n```' });
+  const r = await run(['ask', '--agent', `api=${a}`, '--agent', `web=${b}`, 'review']);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stderr, /workspace: api \(not a git repo: all files\), web \(not a git repo: all files\); data files hidden/);
+  assert.match(asks()[0].prompt, /`api\/`, `web\/`/);
+  assert.match(asks()[1].prompt, /### READ web\/y\.txt\n```\n1\ty\n/);
+  assert.strictEqual(r.stdout.trim(), 'done');
+  const missing = await run(['ask', '--agent', path.join(home, 'nope'), 'q']);
+  assert.strictEqual(missing.code, 1);
+  assert.match(missing.stderr, /agent folder not found/);
+});
